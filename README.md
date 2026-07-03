@@ -165,41 +165,43 @@ GitHub → Settings → Developer settings → OAuth Apps → New OAuth App:
 
 Copy the Client ID and generate a Client Secret.
 
-### 5. Deploy the Worker
+### 5. Deploy the Worker (dashboard only — no wrangler CLI needed)
 
-```bash
-cd worker
-npm install
-npx wrangler kv namespace create OAUTH_KV
-# paste the returned id into wrangler.toml ([[kv_namespaces]] id = ...)
-```
+Everything is done from the Cloudflare dashboard. One rule to keep in mind:
+**bindings** (KV, Durable Objects) must live in `wrangler.toml` — bindings
+added only in the dashboard UI get removed on the next push-triggered
+deploy, because the config file is authoritative for them. **Variables and
+secrets** are the opposite: `keep_vars = true` in `wrangler.toml` makes
+dashboard-managed variables survive every deploy, so all of those are set
+in the UI and never committed.
 
-Edit `wrangler.toml` `[vars]`:
+1. **Create the KV namespace**: dashboard → Storage & Databases → KV →
+   Create namespace (name it e.g. `lightsail-mcp-oauth`). Copy its
+   **Namespace ID**.
+2. **Paste the id into `worker/wrangler.toml`** (`[[kv_namespaces]]` →
+   `id = "..."`) and commit — editing the file in the GitHub web UI is
+   fine. The id is an identifier, not a secret; it's safe in the repo.
+   (This is the one thing that can't be injected via dashboard env vars —
+   see the rule above.)
+3. **Connect the repo**: Workers & Pages → Create → Workers → Import a
+   repository → pick this repo, and set **Root Directory = `worker`**.
+   The defaults (build command `npx wrangler deploy`) are correct. The
+   first build creates the Worker and the Durable Object migration.
+4. **Set variables and secrets**: Worker → Settings → Variables and
+   Secrets:
+   - Plain text: `ALLOWED_GITHUB_USER` = your GitHub username,
+     `INTERNAL_SERVICE_URL` = `https://lightsail-internal.<yourdomain>.com`
+   - Secrets: `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` (step 4),
+     `ACCESS_CLIENT_ID`, `ACCESS_CLIENT_SECRET` (step 3), and
+     `COOKIE_ENCRYPTION_KEY` (any long random string, e.g. from
+     `openssl rand -hex 32`).
 
-- `ALLOWED_GITHUB_USER` — your GitHub username (the only one allowed in)
-- `INTERNAL_SERVICE_URL` — `https://lightsail-internal.<yourdomain>.com`
-
-Set the secrets:
-
-```bash
-npx wrangler secret put GITHUB_CLIENT_ID       # from step 4
-npx wrangler secret put GITHUB_CLIENT_SECRET   # from step 4
-npx wrangler secret put COOKIE_ENCRYPTION_KEY  # openssl rand -hex 32
-npx wrangler secret put ACCESS_CLIENT_ID       # from step 3
-npx wrangler secret put ACCESS_CLIENT_SECRET   # from step 3
-```
-
-Deploy and attach the custom domain:
-
-```bash
-npx wrangler deploy
-```
-
-Then in the dashboard (Workers & Pages → lightsail-mcp → Settings → Domains
-& Routes) add the custom domain `mcp-ssh.<yourdomain>.com`. If you use
-Workers Builds instead of CLI deploys, connect the repo with
-**Root Directory = `worker`** — secrets and the KV namespace persist across
-builds.
+   Until all seven are set, the Worker responds with a message listing
+   exactly which ones are missing rather than failing cryptically.
+5. **Redeploy** so the new settings apply (Deployments → retry latest, or
+   just push any commit).
+6. **Custom domain**: Worker → Settings → Domains & Routes → Add →
+   Custom domain → `mcp-ssh.<yourdomain>.com`.
 
 ### 6. Connect Claude
 

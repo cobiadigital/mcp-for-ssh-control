@@ -1,4 +1,8 @@
 # Copy to .dev.vars for local `wrangler dev`. Never commit .dev.vars.
+# In production these are all set in the dashboard (Settings → Variables
+# and Secrets), not here.
+ALLOWED_GITHUB_USER=your-github-username
+INTERNAL_SERVICE_URL=https://lightsail-internal.example.com
 GITHUB_CLIENT_ID=your-github-oauth-app-client-id
 GITHUB_CLIENT_SECRET=your-github-oauth-app-client-secret
 COOKIE_ENCRYPTION_KEY=any-long-random-string

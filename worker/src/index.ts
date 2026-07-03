@@ -3,7 +3,7 @@ import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { GitHubHandler } from "./github-handler";
-import type { Env, Props } from "./types";
+import { missingConfig, type Env, type Props } from "./types";
 
 /**
  * How long we wait for the internal service (through the Cloudflare Tunnel)
@@ -38,6 +38,16 @@ async function callInternal(
   command: string,
   args: Record<string, unknown> = {}
 ): Promise<ToolResult> {
+  // Vars/secrets are managed in the dashboard (Settings → Variables and
+  // Secrets), so a fresh deploy can be missing them — say so explicitly.
+  const missing = missingConfig(env);
+  if (missing.length > 0) {
+    return err(
+      `Worker is not fully configured — set these in the Cloudflare dashboard ` +
+        `(Worker → Settings → Variables and Secrets): ${missing.join(", ")}`
+    );
+  }
+
   const url = `${env.INTERNAL_SERVICE_URL.replace(/\/$/, "")}/run`;
   let res: Response;
   try {
