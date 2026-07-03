@@ -76,23 +76,43 @@ cd mcp-for-ssh-control/internal-service
 npm install
 ```
 
-Create `/etc/lightsail-mcp-internal.env` (mode 600, owned by root or the
-service user). You'll fill in the two `ACCESS_*` values in step 3:
+Create `.env` in the `internal-service/` folder (it's gitignored, so
+`git pull` never touches it). You'll fill in the two `ACCESS_*` values in
+step 3:
 
 ```bash
-ACCESS_CLIENT_ID=<service token client id, ends in .access>
-ACCESS_CLIENT_SECRET=<service token client secret>
-# The exact docker container names you allow (docker ps --format '{{.Names}}')
+cd ~/mcp-for-ssh-control/internal-service
+tee .env > /dev/null <<'EOF'
+ACCESS_CLIENT_ID=REPLACE_ME.access
+ACCESS_CLIENT_SECRET=REPLACE_ME
+# The exact docker container names you allow, comma-separated
+# (get them with: docker ps --format '{{.Names}}' | paste -sd, -)
 ALLOWED_CONTAINERS=wordpress,wordpress-db,odoo,odoo-db,wanderer,crm
 ALLOWED_SERVICES=nginx,docker,cloudflared
 PORT=8787
+EOF
+chmod 600 .env
 ```
 
-Run it under systemd (copy
-`lightsail-mcp-internal.service.example` to
-`/etc/systemd/system/lightsail-mcp-internal.service`, adjust paths/user, then
-`sudo systemctl enable --now lightsail-mcp-internal`) — or under pm2:
-`pm2 start server.js --name lightsail-mcp-internal` with the env vars set.
+Then run it — two options depending on whether you have root:
+
+**Without sudo (user-level, e.g. a shared/managed host):** use pm2 with the
+bundled `start.sh` wrapper, which loads `.env` and starts the server:
+
+```bash
+npm install -g pm2   # if this needs root: npm config set prefix ~/.local
+                     # and add ~/.local/bin to PATH first
+pm2 start ./start.sh --name lightsail-mcp-internal
+```
+
+Prerequisite check: run `docker ps` as your user. If it's denied, you're not
+in the `docker` group and the `docker_*` tools can't work until a host admin
+adds you (`systemctl status` and the disk/memory/uptime tools are unaffected
+— reading service status doesn't need privileges).
+
+**With sudo:** copy `lightsail-mcp-internal.service.example` to
+`/etc/systemd/system/lightsail-mcp-internal.service`, adjust paths/user,
+then `sudo systemctl enable --now lightsail-mcp-internal`.
 
 The service refuses to start without the `ACCESS_*` vars, and only ever
 listens on `127.0.0.1`.
@@ -106,17 +126,26 @@ ACCESS_CLIENT_ID=... ACCESS_CLIENT_SECRET=... ./smoke-test.sh
 
 ### 2. Cloudflare Tunnel
 
+cloudflared is a single static binary, so no package manager or root is
+needed — download it into `~/bin`:
+
 ```bash
-# on the box — install cloudflared, then:
+mkdir -p ~/bin
+curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+  -o ~/bin/cloudflared
+chmod +x ~/bin/cloudflared
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+
 cloudflared tunnel login
 cloudflared tunnel create lightsail-mcp
 ```
 
-Create `~/.cloudflared/config.yml`:
+Create `~/.cloudflared/config.yml` (everything cloudflared needs lives in
+`~/.cloudflared/`, no root required):
 
 ```yaml
 tunnel: <TUNNEL_ID>
-credentials-file: /home/ubuntu/.cloudflared/<TUNNEL_ID>.json
+credentials-file: /home/<youruser>/.cloudflared/<TUNNEL_ID>.json
 ingress:
   - hostname: lightsail-internal.<yourdomain>.com
     service: http://127.0.0.1:8787
@@ -125,10 +154,25 @@ ingress:
 
 ```bash
 cloudflared tunnel route dns lightsail-mcp lightsail-internal.<yourdomain>.com
-sudo cloudflared service install     # runs the tunnel under systemd
 ```
 
-No firewall changes — the tunnel is an outbound connection.
+Then run the tunnel. Without sudo, keep it under pm2 alongside the internal
+service; with sudo, `sudo cloudflared service install` installs it under
+systemd instead:
+
+```bash
+pm2 start "cloudflared tunnel run lightsail-mcp" --name cloudflared
+```
+
+**Surviving reboots (user-level):** `pm2 startup` normally wants root, so
+use a user crontab instead — it restores both pm2 processes on boot:
+
+```bash
+pm2 save
+( crontab -l 2>/dev/null; echo "@reboot $(which pm2) resurrect" ) | crontab -
+```
+
+No firewall changes either way — the tunnel is an outbound connection.
 
 ### 3. Cloudflare Access (service token + policy)
 
@@ -144,9 +188,11 @@ In the Cloudflare dashboard, **Zero Trust → Access**:
    **Service Auth** (not Allow) that includes your service token.
 
 Now the tunnel hostname rejects anything without the token at Cloudflare's
-edge, and the internal service re-checks it again on the box. Restart the
-internal service after putting the real token values in its env file, and
-re-run the smoke test against the public hostname to confirm the whole path:
+edge, and the internal service re-checks it again on the box. Put the real
+token values into `internal-service/.env`, restart the service
+(`pm2 restart lightsail-mcp-internal`, or `sudo systemctl restart
+lightsail-mcp-internal` on the systemd path), and re-run the smoke test
+against the public hostname to confirm the whole path:
 
 ```bash
 ACCESS_CLIENT_ID=... ACCESS_CLIENT_SECRET=... \
