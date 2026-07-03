@@ -1,0 +1,23 @@
+{
+  "name": "lightsail-mcp-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Remote MCP server (Cloudflare Worker) that controls a Lightsail box through a Cloudflare Tunnel",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^0.8.1",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "agents": "0.17.3",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "wrangler": "^4.107.0"
+  }
+}

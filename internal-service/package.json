@@ -1,0 +1,14 @@
+{
+  "name": "lightsail-mcp-internal-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Whitelist-only command service, reachable only via Cloudflare Tunnel",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "smoke-test": "bash smoke-test.sh"
+  },
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}

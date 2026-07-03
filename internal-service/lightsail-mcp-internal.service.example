@@ -1,0 +1,30 @@
+# Example systemd unit for the internal service. Copy to
+# /etc/systemd/system/lightsail-mcp-internal.service, fill in the
+# environment file, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now lightsail-mcp-internal
+#
+# (Running under pm2 instead is fine too — see README.)
+
+[Unit]
+Description=Lightsail MCP internal command service (loopback only)
+After=network.target docker.service
+
+[Service]
+Type=simple
+# Adjust user/paths to your setup. The user needs to be in the `docker`
+# group (or use root) for docker commands, and needs systemctl read access.
+User=ubuntu
+WorkingDirectory=/home/ubuntu/mcp-for-ssh-control/internal-service
+# Put secrets in this file (chmod 600), e.g.:
+#   ACCESS_CLIENT_ID=xxxx.access
+#   ACCESS_CLIENT_SECRET=xxxx
+#   ALLOWED_CONTAINERS=wordpress,odoo,wanderer,crm
+#   ALLOWED_SERVICES=nginx,docker,cloudflared
+EnvironmentFile=/etc/lightsail-mcp-internal.env
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
