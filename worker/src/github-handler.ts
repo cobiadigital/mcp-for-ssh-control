@@ -20,7 +20,7 @@
  */
 
 import type { AuthRequest } from "@cloudflare/workers-oauth-provider";
-import type { Env, Props } from "./types";
+import { missingConfig, type Env, type Props } from "./types";
 import {
   clientIdAlreadyApproved,
   parseRedirectApproval,
@@ -190,6 +190,19 @@ async function handleCallback(request: Request, env: Env): Promise<Response> {
 export const GitHubHandler = {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const { pathname } = new URL(request.url);
+
+    // Fail closed with a readable message if dashboard configuration is
+    // incomplete (vars/secrets live in Settings → Variables and Secrets,
+    // not in wrangler.toml). In particular, never run the allowlist check
+    // with an empty ALLOWED_GITHUB_USER.
+    const missing = missingConfig(env);
+    if (missing.length > 0) {
+      return new Response(
+        `Worker is not fully configured. Set these in the Cloudflare dashboard ` +
+          `(Worker → Settings → Variables and Secrets): ${missing.join(", ")}`,
+        { status: 500 }
+      );
+    }
 
     if (pathname === "/authorize" && request.method === "GET") {
       return handleAuthorize(request, env);

@@ -7,11 +7,16 @@ import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
  * after `npm install` and again whenever wrangler.toml bindings change.
  */
 export interface Env extends Cloudflare.Env {
-  // Bindings declared in wrangler.toml (OAUTH_KV, MCP_OBJECT,
-  // ALLOWED_GITHUB_USER, INTERNAL_SERVICE_URL) are already typed on the
-  // generated Cloudflare.Env — only add what wrangler can't know about:
+  // Bindings declared in wrangler.toml (OAUTH_KV, MCP_OBJECT) are already
+  // typed on the generated Cloudflare.Env — only add what wrangler can't
+  // know about, i.e. everything managed in the dashboard under
+  // Settings → Variables and Secrets:
 
-  // --- secrets set via `wrangler secret put` ---
+  // --- plain text variables (dashboard-managed, keep_vars = true) ---
+  ALLOWED_GITHUB_USER: string;
+  INTERNAL_SERVICE_URL: string;
+
+  // --- secrets (dashboard-managed) ---
   GITHUB_CLIENT_ID: string;
   GITHUB_CLIENT_SECRET: string;
   COOKIE_ENCRYPTION_KEY: string;
@@ -23,6 +28,25 @@ export interface Env extends Cloudflare.Env {
    * Not a wrangler binding — do not add it to wrangler.toml.
    */
   OAUTH_PROVIDER: OAuthHelpers;
+}
+
+/**
+ * Everything above except OAUTH_PROVIDER is dashboard-managed and therefore
+ * can be missing on a fresh deploy. Callers use this to fail with a clear
+ * message instead of a confusing downstream error.
+ */
+export function missingConfig(env: Env): string[] {
+  return (
+    [
+      "ALLOWED_GITHUB_USER",
+      "INTERNAL_SERVICE_URL",
+      "GITHUB_CLIENT_ID",
+      "GITHUB_CLIENT_SECRET",
+      "COOKIE_ENCRYPTION_KEY",
+      "ACCESS_CLIENT_ID",
+      "ACCESS_CLIENT_SECRET",
+    ] as const
+  ).filter((key) => !env[key]);
 }
 
 /**

@@ -1,7 +1,19 @@
 # Cloudflare Worker config for the Lightsail MCP server.
 #
-# In the Cloudflare dashboard, configure Workers Builds with
-# Root Directory = `worker` so pushes only build/deploy this folder.
+# Deployment model: dashboard-only (Workers Builds), no local wrangler needed.
+# Connect the repo in the dashboard with Root Directory = `worker`; every
+# push then builds and deploys this folder.
+#
+# IMPORTANT — how config vs. dashboard settings interact on each deploy:
+#   - BINDINGS (Durable Objects, KV) must be declared in THIS file. Bindings
+#     added only through the dashboard UI are removed on the next
+#     push-triggered deploy, because this config file is authoritative for
+#     bindings. That's why the KV namespace id has to be pasted below (a
+#     one-time edit — the GitHub web editor is fine).
+#   - VARIABLES and SECRETS are the opposite: `keep_vars = true` below tells
+#     wrangler NOT to touch dashboard-managed variables, so you set all of
+#     them in the dashboard (Worker → Settings → Variables and Secrets) and
+#     they survive every deploy. Nothing sensitive ever lives in this file.
 
 name = "lightsail-mcp"
 main = "src/index.ts"
@@ -9,6 +21,10 @@ compatibility_date = "2025-11-01"
 # nodejs_compat is required by @modelcontextprotocol/sdk (it pulls in
 # node builtins like crypto/buffer at the edges).
 compatibility_flags = ["nodejs_compat"]
+
+# Preserve environment variables managed in the dashboard instead of
+# deleting anything not listed in this file (see note above).
+keep_vars = true
 
 # ---------------------------------------------------------------------------
 # Durable Object binding for the MCP agent.
@@ -29,28 +45,39 @@ new_sqlite_classes = ["LightsailMCP"]
 
 # ---------------------------------------------------------------------------
 # KV namespace used by @cloudflare/workers-oauth-provider to store OAuth
-# clients, grants, and tokens. Create it once with:
+# clients, grants, and tokens.
 #
-#   npx wrangler kv namespace create OAUTH_KV
+# Create it in the dashboard: Storage & Databases → KV → Create namespace
+# (any name, e.g. "lightsail-mcp-oauth"), then copy its Namespace ID.
 #
-# then paste the returned id below.
+# Two ways to provide the id (it's an identifier, not a secret — useless
+# without authenticated access to the Cloudflare account — so committing
+# it is safe; but option B keeps it out of the repo entirely):
+#
+#   A) Paste it below in place of the placeholder and commit.
+#
+#   B) Keep the placeholder and substitute at build time. In the Worker's
+#      build settings (Settings → Build):
+#        Build command:
+#          sed -i "s|<REPLACE_WITH_KV_NAMESPACE_ID>|$OAUTH_KV_NAMESPACE_ID|" wrangler.toml
+#        Build variable:
+#          OAUTH_KV_NAMESPACE_ID = <the namespace id>
+#      (wrangler.toml itself can't interpolate env vars, hence the sed.)
 # ---------------------------------------------------------------------------
 [[kv_namespaces]]
 binding = "OAUTH_KV"
 id = "<REPLACE_WITH_KV_NAMESPACE_ID>"
 
-[vars]
-# The only GitHub account allowed to authorize this MCP server
-# (compared case-insensitively against the GitHub `login`).
-ALLOWED_GITHUB_USER = "cobiadigital"
-# Public hostname of the Cloudflare Tunnel that fronts the internal
-# service on the Lightsail box (see README).
-INTERNAL_SERVICE_URL = "https://lightsail-internal.example.com"
-
 # ---------------------------------------------------------------------------
-# Secrets — set these with `npx wrangler secret put <NAME>`, never in this
-# file:
+# Runtime configuration — set ALL of these in the dashboard under
+# Worker → Settings → Variables and Secrets (kept across deploys thanks to
+# keep_vars above):
 #
+# Plain text variables:
+#   ALLOWED_GITHUB_USER    — the ONLY GitHub username allowed to log in
+#   INTERNAL_SERVICE_URL   — https://lightsail-internal.<yourdomain>.com
+#
+# Secrets:
 #   GITHUB_CLIENT_ID       — GitHub OAuth app client id
 #   GITHUB_CLIENT_SECRET   — GitHub OAuth app client secret
 #   COOKIE_ENCRYPTION_KEY  — random string for signing the approval cookie
