@@ -224,11 +224,19 @@ in the UI and never committed.
 1. **Create the KV namespace**: dashboard → Storage & Databases → KV →
    Create namespace (name it e.g. `lightsail-mcp-oauth`). Copy its
    **Namespace ID**.
-2. **Paste the id into `worker/wrangler.toml`** (`[[kv_namespaces]]` →
-   `id = "..."`) and commit — editing the file in the GitHub web UI is
-   fine. The id is an identifier, not a secret; it's safe in the repo.
-   (This is the one thing that can't be injected via dashboard env vars —
-   see the rule above.)
+2. **Provide the id**, either way:
+   - *Commit it*: paste it into `worker/wrangler.toml`
+     (`[[kv_namespaces]]` → `id = "..."`) — the GitHub web editor is
+     fine. The id is an identifier, not a secret: it's useless without
+     authenticated access to your Cloudflare account, so it's safe in a
+     public repo (Cloudflare's own templates commit KV ids).
+   - *Keep it out of the repo*: leave the placeholder and substitute at
+     build time. In the Worker's build settings (Settings → Build), set
+     the **Build command** to
+     `sed -i "s|<REPLACE_WITH_KV_NAMESPACE_ID>|$OAUTH_KV_NAMESPACE_ID|" wrangler.toml`
+     and add a **build variable** `OAUTH_KV_NAMESPACE_ID` with the id as
+     its value. (`wrangler.toml` can't interpolate env vars itself, so
+     the substitution happens just before deploy.)
 3. **Connect the repo**: Workers & Pages → Create → Workers → Import a
    repository → pick this repo, and set **Root Directory = `worker`**.
    The defaults (build command `npx wrangler deploy`) are correct. The

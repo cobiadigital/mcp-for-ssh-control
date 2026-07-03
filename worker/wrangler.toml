@@ -48,9 +48,21 @@ new_sqlite_classes = ["LightsailMCP"]
 # clients, grants, and tokens.
 #
 # Create it in the dashboard: Storage & Databases → KV → Create namespace
-# (any name, e.g. "lightsail-mcp-oauth"), then copy its Namespace ID and
-# paste it below. The id is not a secret — it's just an identifier, safe
-# to commit.
+# (any name, e.g. "lightsail-mcp-oauth"), then copy its Namespace ID.
+#
+# Two ways to provide the id (it's an identifier, not a secret — useless
+# without authenticated access to the Cloudflare account — so committing
+# it is safe; but option B keeps it out of the repo entirely):
+#
+#   A) Paste it below in place of the placeholder and commit.
+#
+#   B) Keep the placeholder and substitute at build time. In the Worker's
+#      build settings (Settings → Build):
+#        Build command:
+#          sed -i "s|<REPLACE_WITH_KV_NAMESPACE_ID>|$OAUTH_KV_NAMESPACE_ID|" wrangler.toml
+#        Build variable:
+#          OAUTH_KV_NAMESPACE_ID = <the namespace id>
+#      (wrangler.toml itself can't interpolate env vars, hence the sed.)
 # ---------------------------------------------------------------------------
 [[kv_namespaces]]
 binding = "OAUTH_KV"
