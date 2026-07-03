@@ -1,0 +1,6 @@
+# Copy to .dev.vars for local `wrangler dev`. Never commit .dev.vars.
+GITHUB_CLIENT_ID=your-github-oauth-app-client-id
+GITHUB_CLIENT_SECRET=your-github-oauth-app-client-secret
+COOKIE_ENCRYPTION_KEY=any-long-random-string
+ACCESS_CLIENT_ID=xxxxxxxx.access
+ACCESS_CLIENT_SECRET=xxxxxxxx

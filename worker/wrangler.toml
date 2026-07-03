@@ -1,0 +1,60 @@
+# Cloudflare Worker config for the Lightsail MCP server.
+#
+# In the Cloudflare dashboard, configure Workers Builds with
+# Root Directory = `worker` so pushes only build/deploy this folder.
+
+name = "lightsail-mcp"
+main = "src/index.ts"
+compatibility_date = "2025-11-01"
+# nodejs_compat is required by @modelcontextprotocol/sdk (it pulls in
+# node builtins like crypto/buffer at the edges).
+compatibility_flags = ["nodejs_compat"]
+
+# ---------------------------------------------------------------------------
+# Durable Object binding for the MCP agent.
+#
+# The `agents` package's McpAgent runs each MCP session inside a Durable
+# Object. `McpAgent.serve()/serveSSE()` look up the namespace under the
+# binding name "MCP_OBJECT" by default, and `class_name` must match the
+# exported class in src/index.ts exactly (`LightsailMCP`).
+# ---------------------------------------------------------------------------
+[durable_objects]
+bindings = [{ name = "MCP_OBJECT", class_name = "LightsailMCP" }]
+
+# McpAgent requires SQLite-backed Durable Objects (it persists transport
+# state in DO storage), hence `new_sqlite_classes` rather than `new_classes`.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["LightsailMCP"]
+
+# ---------------------------------------------------------------------------
+# KV namespace used by @cloudflare/workers-oauth-provider to store OAuth
+# clients, grants, and tokens. Create it once with:
+#
+#   npx wrangler kv namespace create OAUTH_KV
+#
+# then paste the returned id below.
+# ---------------------------------------------------------------------------
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "<REPLACE_WITH_KV_NAMESPACE_ID>"
+
+[vars]
+# The only GitHub account allowed to authorize this MCP server
+# (compared case-insensitively against the GitHub `login`).
+ALLOWED_GITHUB_USER = "cobiadigital"
+# Public hostname of the Cloudflare Tunnel that fronts the internal
+# service on the Lightsail box (see README).
+INTERNAL_SERVICE_URL = "https://lightsail-internal.example.com"
+
+# ---------------------------------------------------------------------------
+# Secrets — set these with `npx wrangler secret put <NAME>`, never in this
+# file:
+#
+#   GITHUB_CLIENT_ID       — GitHub OAuth app client id
+#   GITHUB_CLIENT_SECRET   — GitHub OAuth app client secret
+#   COOKIE_ENCRYPTION_KEY  — random string for signing the approval cookie
+#                            (e.g. `openssl rand -hex 32`)
+#   ACCESS_CLIENT_ID       — Cloudflare Access service token client id
+#   ACCESS_CLIENT_SECRET   — Cloudflare Access service token client secret
+# ---------------------------------------------------------------------------
