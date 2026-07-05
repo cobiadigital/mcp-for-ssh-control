@@ -49,6 +49,11 @@ async function callInternal(
   }
 
   const url = `${env.INTERNAL_SERVICE_URL.replace(/\/$/, "")}/run`;
+  // Diagnostic logging — visible in the Worker's real-time logs. Lets us see
+  // whether the internal-service hop succeeds, errors, or times out without
+  // having to guess from the MCP transport churn.
+  const startedAt = Date.now();
+  console.log(`callInternal → ${command} POST ${url}`);
   let res: Response;
   try {
     res = await fetch(url, {
@@ -72,6 +77,9 @@ async function callInternal(
     // AbortSignal.timeout raises a DOMException named "TimeoutError";
     // anything else is a connection-level failure (tunnel down, DNS, TLS).
     const isTimeout = e instanceof DOMException && e.name === "TimeoutError";
+    console.log(
+      `callInternal ✗ ${command} ${isTimeout ? "TIMEOUT" : "FETCH-ERROR"} after ${Date.now() - startedAt}ms: ${e instanceof Error ? e.message : String(e)}`
+    );
     return err(
       isTimeout
         ? `Timed out after ${INTERNAL_FETCH_TIMEOUT_MS / 1000}s waiting for the Lightsail internal service. ` +
@@ -81,6 +89,9 @@ async function callInternal(
   }
 
   const text = await res.text();
+  console.log(
+    `callInternal ← ${command} HTTP ${res.status} in ${Date.now() - startedAt}ms (${text.length} bytes)`
+  );
   if (!res.ok) {
     // The internal service returns JSON {error} for auth/whitelist/exec
     // failures; Cloudflare Access returns an HTML block page on 403.
