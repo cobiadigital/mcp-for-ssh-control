@@ -72,8 +72,16 @@ function timingSafeEqual(a, b) {
 }
 
 function requireAccessToken(req, res, next) {
-  const id = req.get("CF-Access-Client-Id") || "";
-  const secret = req.get("CF-Access-Client-Secret") || "";
+  // Requests arriving through Cloudflare Access have had their
+  // CF-Access-Client-Id/Secret headers consumed at the edge (Access
+  // validates them and forwards a JWT instead), so the Worker sends a
+  // second copy in X-Internal-Client-Id/Secret which pass through
+  // untouched. Direct/local calls (smoke test on the box) can use either
+  // pair. Both compare against the same service token values.
+  const id =
+    req.get("CF-Access-Client-Id") || req.get("X-Internal-Client-Id") || "";
+  const secret =
+    req.get("CF-Access-Client-Secret") || req.get("X-Internal-Client-Secret") || "";
   const idOk = timingSafeEqual(id, ACCESS_CLIENT_ID);
   const secretOk = timingSafeEqual(secret, ACCESS_CLIENT_SECRET);
   if (!idOk || !secretOk) {

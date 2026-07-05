@@ -24,13 +24,17 @@ fi
 PASS=0
 FAIL=0
 
-# check <description> <expected-http-status> <curl args...>
+# check <description> <expected-http-status(es)> <curl args...>
+# Expected can be a space-separated list, e.g. "401 403" — useful because
+# Cloudflare Access blocks bad credentials at the edge with 403 before they
+# reach the service's own 401.
 check() {
   local desc="$1" expected="$2"
   shift 2
   local status
+  : > /tmp/smoke-body.$$   # ensure the body file exists even if curl gets no response
   status=$(curl -s -o /tmp/smoke-body.$$ -w "%{http_code}" --max-time 15 "$@")
-  if [[ "$status" == "$expected" ]]; then
+  if [[ " $expected " == *" $status "* ]]; then
     echo "PASS: $desc (HTTP $status)"
     PASS=$((PASS + 1))
   else
@@ -41,19 +45,27 @@ check() {
   rm -f /tmp/smoke-body.$$
 }
 
-AUTH=(-H "CF-Access-Client-Id: $ID" -H "CF-Access-Client-Secret: $SECRET")
+# Both header pairs: CF-Access-* satisfies Cloudflare Access at the edge
+# (which consumes those headers), X-Internal-* reaches the origin so the
+# service's own check passes too. Direct/local runs accept either.
+AUTH=(
+  -H "CF-Access-Client-Id: $ID" -H "CF-Access-Client-Secret: $SECRET"
+  -H "X-Internal-Client-Id: $ID" -H "X-Internal-Client-Secret: $SECRET"
+)
 JSON=(-H "Content-Type: application/json")
 
 echo "== Auth checks =="
-check "no auth headers rejected" 401 \
+check "no auth headers rejected" "401 403 302" \
   "$BASE_URL/healthz"
 
-check "wrong secret rejected" 401 \
+check "wrong secret rejected" "401 403 302" \
   -H "CF-Access-Client-Id: $ID" -H "CF-Access-Client-Secret: definitely-wrong" \
+  -H "X-Internal-Client-Id: $ID" -H "X-Internal-Client-Secret: definitely-wrong" \
   "$BASE_URL/healthz"
 
-check "wrong client id rejected" 401 \
+check "wrong client id rejected" "401 403 302" \
   -H "CF-Access-Client-Id: not-a-real-id.access" -H "CF-Access-Client-Secret: $SECRET" \
+  -H "X-Internal-Client-Id: not-a-real-id.access" -H "X-Internal-Client-Secret: $SECRET" \
   "$BASE_URL/healthz"
 
 check "valid token accepted on /healthz" 200 \

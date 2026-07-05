@@ -55,12 +55,15 @@ async function callInternal(
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        // These two headers serve double duty: Cloudflare Access validates
-        // them at the edge (service token policy on the tunnel hostname),
-        // and the internal service re-checks them itself as defense in
-        // depth in case the tunnel is ever misconfigured.
+        // Two copies of the same credentials, for the two auth layers:
+        // Cloudflare Access validates the CF-Access-* pair at the edge and
+        // CONSUMES those headers (the origin never sees them). The
+        // X-Internal-* pair passes through Access untouched so the internal
+        // service can re-check the token itself as defense in depth.
         "CF-Access-Client-Id": env.ACCESS_CLIENT_ID,
         "CF-Access-Client-Secret": env.ACCESS_CLIENT_SECRET,
+        "X-Internal-Client-Id": env.ACCESS_CLIENT_ID,
+        "X-Internal-Client-Secret": env.ACCESS_CLIENT_SECRET,
       },
       body: JSON.stringify({ command, args }),
       signal: AbortSignal.timeout(INTERNAL_FETCH_TIMEOUT_MS),
