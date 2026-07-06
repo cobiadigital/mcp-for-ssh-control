@@ -225,6 +225,112 @@ export class LightsailMCP extends McpAgent<Env, Record<string, never>, Props> {
       },
       async () => callInternal(this.env, "uptime")
     );
+
+    // --- File and script tools ---------------------------------------------
+    // These only work inside the directory roots configured on the box via
+    // ALLOWED_PATHS; anything outside (or any path when ALLOWED_PATHS is
+    // unset) is rejected by the internal service.
+
+    const pathArg = z
+      .string()
+      .startsWith("/", "path must be absolute")
+      .describe(
+        "Absolute path on the server. Must be inside one of the server's ALLOWED_PATHS roots."
+      );
+
+    this.server.registerTool(
+      "list_directory",
+      {
+        title: "List directory",
+        description:
+          "List the entries of a directory on the Lightsail server (type, size, mtime, name).",
+        inputSchema: { path: pathArg },
+      },
+      async ({ path }) => callInternal(this.env, "list_directory", { path })
+    );
+
+    this.server.registerTool(
+      "read_file",
+      {
+        title: "Read file",
+        description:
+          "Read a text file on the Lightsail server (truncated past 512KB).",
+        inputSchema: { path: pathArg },
+      },
+      async ({ path }) => callInternal(this.env, "read_file", { path })
+    );
+
+    this.server.registerTool(
+      "write_file",
+      {
+        title: "Write file",
+        description:
+          "Create or overwrite a text file on the Lightsail server with the given content (max 512KB). The parent directory must already exist.",
+        inputSchema: {
+          path: pathArg,
+          content: z.string().describe("Full file content to write"),
+        },
+      },
+      async ({ path, content }) =>
+        callInternal(this.env, "write_file", { path, content })
+    );
+
+    this.server.registerTool(
+      "edit_file",
+      {
+        title: "Edit file",
+        description:
+          "Edit a text file on the Lightsail server by exact string replacement. old_string must match exactly once unless replace_all is set.",
+        inputSchema: {
+          path: pathArg,
+          old_string: z.string().min(1).describe("Exact text to find"),
+          new_string: z.string().describe("Replacement text"),
+          replace_all: z
+            .boolean()
+            .optional()
+            .describe("Replace every occurrence instead of requiring a unique match"),
+        },
+      },
+      async ({ path, old_string, new_string, replace_all }) =>
+        callInternal(this.env, "edit_file", { path, old_string, new_string, replace_all })
+    );
+
+    this.server.registerTool(
+      "check_script",
+      {
+        title: "Check script syntax",
+        description:
+          "Diagnose a script on the Lightsail server without running it: bash -n / sh -n (plus shellcheck when installed) for shell, python3 -m py_compile for Python, node --check for JavaScript. Interpreter is detected from the shebang or file extension.",
+        inputSchema: { path: pathArg },
+      },
+      async ({ path }) => callInternal(this.env, "check_script", { path })
+    );
+
+    this.server.registerTool(
+      "run_script",
+      {
+        title: "Run script",
+        description:
+          "Execute a script on the Lightsail server (bash/sh/python3/node, detected from shebang or extension) and return its exit code and output. Use for diagnosing script behavior.",
+        inputSchema: {
+          path: pathArg,
+          args: z
+            .array(z.string().max(256))
+            .max(16)
+            .optional()
+            .describe("Arguments passed to the script (max 16, each under 256 chars)"),
+          timeout_seconds: z
+            .number()
+            .int()
+            .min(1)
+            .max(120)
+            .optional()
+            .describe("Kill the script after this many seconds (default 30, max 120)"),
+        },
+      },
+      async ({ path, args, timeout_seconds }) =>
+        callInternal(this.env, "run_script", { path, args, timeout_seconds })
+    );
   }
 }
 

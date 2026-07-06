@@ -4,10 +4,12 @@
 #
 #   ACCESS_CLIENT_ID=... ACCESS_CLIENT_SECRET=... ./smoke-test.sh [base-url]
 #
-# It verifies the two security properties end to end:
+# It verifies the security properties end to end:
 #   - requests without / with wrong Access service-token headers are rejected (401)
 #   - non-allowlisted container/service names are rejected (403), and unknown
 #     commands are rejected (400)
+#   - file/script paths outside the ALLOWED_PATHS roots (or any path when
+#     ALLOWED_PATHS is unset) are rejected (403), including ../ escapes
 # plus one happy-path command (uptime) to prove the service actually works.
 
 set -u
@@ -91,6 +93,30 @@ check "option-injection container name rejected" 400 \
 
 check "non-allowlisted service rejected" 403 \
   "${AUTH[@]}" "${JSON[@]}" -X POST -d '{"command":"service_status","args":{"service":"sshd"}}' \
+  "$BASE_URL/run"
+
+echo
+echo "== Path checks =="
+# 403 either way: "outside the allowed roots" when ALLOWED_PATHS is set,
+# "file tools are disabled" when it isn't.
+check "path outside allowed roots rejected" 403 \
+  "${AUTH[@]}" "${JSON[@]}" -X POST -d '{"command":"read_file","args":{"path":"/etc/shadow"}}' \
+  "$BASE_URL/run"
+
+check "dot-dot path escape rejected" 403 \
+  "${AUTH[@]}" "${JSON[@]}" -X POST -d '{"command":"read_file","args":{"path":"/home/../etc/shadow"}}' \
+  "$BASE_URL/run"
+
+check "relative path rejected" "400 403" \
+  "${AUTH[@]}" "${JSON[@]}" -X POST -d '{"command":"read_file","args":{"path":"foo.txt"}}' \
+  "$BASE_URL/run"
+
+check "write outside allowed roots rejected" 403 \
+  "${AUTH[@]}" "${JSON[@]}" -X POST -d '{"command":"write_file","args":{"path":"/etc/cron.d/evil","content":"x"}}' \
+  "$BASE_URL/run"
+
+check "running a system binary rejected" 403 \
+  "${AUTH[@]}" "${JSON[@]}" -X POST -d '{"command":"run_script","args":{"path":"/bin/sh"}}' \
   "$BASE_URL/run"
 
 echo
