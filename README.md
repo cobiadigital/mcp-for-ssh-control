@@ -1,8 +1,9 @@
 # Lightsail Server Control via Remote MCP
 
 Manage a Lightsail server — Docker containers, disk/memory checks, service
-status — from Claude (mobile app, claude.ai, or Claude Code) as a custom MCP
-connector, **with no inbound ports opened on the server**.
+status, file editing, and script diagnosis — from Claude (mobile app,
+claude.ai, or Claude Code) as a custom MCP connector, **with no inbound ports
+opened on the server**.
 
 ## Architecture
 
@@ -11,7 +12,9 @@ Claude (any client)
    → HTTPS → Cloudflare Worker (mcp-ssh.<yourdomain>.com)
         - Auth: GitHub OAuth, restricted to ONE allowlisted GitHub username
         - Implements the MCP tools (docker_ps, docker_logs, docker_restart,
-          disk_usage, memory_usage, service_status, uptime)
+          disk_usage, memory_usage, service_status, uptime, plus file and
+          script tools: list_directory, read_file, write_file, edit_file,
+          check_script, run_script)
         - Forwards each tool call over HTTPS, authenticated with a
           Cloudflare Access service token
    → Cloudflare Tunnel (outbound-only from the Lightsail box)
@@ -36,6 +39,16 @@ Security properties this design preserves:
   (no shell interpretation). Container and service names must pass a shape
   check *and* an explicit allowlist (`ALLOWED_CONTAINERS` /
   `ALLOWED_SERVICES` env vars).
+- **File and script tools are jailed to `ALLOWED_PATHS`.** Reading, writing,
+  editing, listing, checking, and running are only possible inside the
+  directory roots you list in `ALLOWED_PATHS` — every path is resolved with
+  `realpath`, so `..` segments and symlinks planted inside a root can't
+  escape it. If `ALLOWED_PATHS` is unset, all six tools are disabled.
+  `run_script` never invokes an arbitrary binary: it runs a script *file*
+  from inside the roots through a fixed interpreter set (bash/sh/python3/
+  node, chosen by shebang or extension). Note the honest caveat: write +
+  run inside the same root is code execution as the service user — only
+  list directories you're comfortable with Claude editing and executing in.
 - **Single-user OAuth.** The Worker's GitHub OAuth flow refuses to issue an
   MCP token to any GitHub account except `ALLOWED_GITHUB_USER`.
 - **No secrets in the repo.** Everything sensitive goes through
@@ -89,6 +102,10 @@ ACCESS_CLIENT_SECRET=REPLACE_ME
 # (get them with: docker ps --format '{{.Names}}' | paste -sd, -)
 ALLOWED_CONTAINERS=wordpress,wordpress-db,odoo,odoo-db,wanderer,crm
 ALLOWED_SERVICES=nginx,docker,cloudflared
+# Directory roots the file/script tools may touch, comma-separated absolute
+# paths. Leave unset to disable those tools entirely. Anything under these
+# roots can be read, edited, AND executed by Claude — scope accordingly.
+ALLOWED_PATHS=/home/ubuntu/scripts,/home/ubuntu/sites
 PORT=8787
 EOF
 chmod 600 .env
@@ -282,8 +299,16 @@ account other than `ALLOWED_GITHUB_USER` gets a 403 and no token.
 | `memory_usage` | — | `free -h` |
 | `service_status` | `service` | `systemctl status <name> --no-pager` |
 | `uptime` | — | `uptime` |
+| `list_directory` | `path` | directory listing (type, size, mtime, name) |
+| `read_file` | `path` | read a text file (truncated past 512KB) |
+| `write_file` | `path`, `content` | create or overwrite a file (max 512KB) |
+| `edit_file` | `path`, `old_string`, `new_string`, `replace_all?` | exact string replacement (must match once unless `replace_all`) |
+| `check_script` | `path` | syntax check without running: `bash -n`/`sh -n` (+ `shellcheck` if installed), `python3 -m py_compile`, `node --check` |
+| `run_script` | `path`, `args?` (≤16), `timeout_seconds?` (1–120) | run a script via bash/sh/python3/node (from shebang or extension); returns exit code + output |
 
-`container` / `service` arguments must be on the box's allowlists.
+`container` / `service` arguments must be on the box's allowlists, and every
+`path` must be inside one of the `ALLOWED_PATHS` roots (the file/script tools
+return 403 until `ALLOWED_PATHS` is configured).
 
 ## Development
 
@@ -314,3 +339,12 @@ whenever `wrangler.toml` bindings change.
 - **`Container "x" is not on the allowlist`** — add the exact name from
   `docker ps --format '{{.Names}}'` to `ALLOWED_CONTAINERS` in the env file
   and restart the internal service.
+- **`File tools are disabled — set ALLOWED_PATHS`** — the file/script tools
+  ship disabled. Add `ALLOWED_PATHS=/some/dir,/other/dir` to the env file and
+  restart the internal service.
+- **`Path "..." is outside the allowed roots`** — the path (after resolving
+  symlinks) isn't under any `ALLOWED_PATHS` root. Add the root or use a path
+  inside one.
+- **`Cannot determine interpreter`** — `check_script`/`run_script` only knows
+  bash, sh, python3, and node. Give the script a shebang line (e.g.
+  `#!/usr/bin/env bash`) or a recognized extension (`.sh`, `.py`, `.js`).
