@@ -110,12 +110,17 @@ in the `docker` group and the `docker_*` tools can't work until a host admin
 adds you (`systemctl status` and the disk/memory/uptime tools are unaffected
 — reading service status doesn't need privileges).
 
-**With sudo:** copy `lightsail-mcp-internal.service.example` to
-`/etc/systemd/system/lightsail-mcp-internal.service`, adjust paths/user,
-then `sudo systemctl enable --now lightsail-mcp-internal`.
+**With sudo (only if you want systemd instead of pm2):** the repo ships
+`internal-service/lightsail-mcp-internal.service.example` as a template for
+this path — it is **optional** and unused by the pm2 route above, so if you
+went the no-sudo way you can ignore that file entirely. To use it: copy it to
+`/etc/systemd/system/lightsail-mcp-internal.service`, edit the `User=` and
+`WorkingDirectory=`/`EnvironmentFile=` paths to match your box, then
+`sudo systemctl daemon-reload && sudo systemctl enable --now lightsail-mcp-internal`.
+Pick pm2 **or** systemd — not both, or two copies will fight over port 8787.
 
-The service refuses to start without the `ACCESS_*` vars, and only ever
-listens on `127.0.0.1`.
+Either way, the service refuses to start without the `ACCESS_*` vars, and
+only ever listens on `127.0.0.1`.
 
 **Verify it** with the smoke test (checks that bad credentials get 401 and
 non-allowlisted names get rejected):
