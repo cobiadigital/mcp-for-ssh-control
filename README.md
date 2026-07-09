@@ -230,49 +230,90 @@ Copy the Client ID and generate a Client Secret.
 
 ### 5. Deploy the Worker (dashboard only — no wrangler CLI needed)
 
-Everything is done from the Cloudflare dashboard. One rule to keep in mind:
-**bindings** (KV, Durable Objects) must live in `wrangler.toml` — bindings
-added only in the dashboard UI get removed on the next push-triggered
-deploy, because the config file is authoritative for them. **Variables and
-secrets** are the opposite: `keep_vars = true` in `wrangler.toml` makes
-dashboard-managed variables survive every deploy, so all of those are set
-in the UI and never committed.
+Everything is done from the Cloudflare dashboard. Cloudflare builds the
+Worker from your repo on every push (Workers Builds), running
+`npx wrangler deploy` for you — you never run wrangler locally.
+
+#### How `wrangler.toml` fits in
+
+`worker/wrangler.toml` is committed to the repo and is the **source of truth
+for the Worker's shape**. On each deploy Cloudflare reads it and reconciles
+the live Worker to match. That split matters:
+
+| Lives in `wrangler.toml` (committed) | Lives in the dashboard (never committed) |
+|---|---|
+| Worker name, `main`, compatibility flags | Plain-text variables (`ALLOWED_GITHUB_USER`, `INTERNAL_SERVICE_URL`) |
+| Durable Object binding + migration (`MCP_OBJECT`) | Secrets (`GITHUB_*`, `ACCESS_*`, `COOKIE_ENCRYPTION_KEY`) |
+| KV binding name + **namespace id** (`OAUTH_KV`) | — |
+
+Two rules follow from this, and they are opposites — which is the part that
+trips people up:
+
+- **Bindings** (KV, Durable Objects) *must* be in `wrangler.toml`. If you add
+  a binding only through the dashboard UI, the next push-triggered deploy
+  **deletes it**, because the config file didn't mention it. This is why the
+  KV namespace id has to be written into the file (step 2 below).
+- **Variables and secrets** are the opposite. `keep_vars = true` (already set
+  in the file) tells wrangler *not* to wipe dashboard-managed variables on
+  deploy. So you set all of those in the UI once and they survive every
+  future deploy — and nothing sensitive ever lands in the repo.
+
+You will only ever edit `wrangler.toml` for one thing during setup: pasting
+the KV namespace id. Everything else in it is already correct.
+
+Then, in order:
 
 1. **Create the KV namespace**: dashboard → Storage & Databases → KV →
    Create namespace (name it e.g. `lightsail-mcp-oauth`). Copy its
-   **Namespace ID**.
-2. **Provide the id**, either way:
-   - *Commit it*: paste it into `worker/wrangler.toml`
-     (`[[kv_namespaces]]` → `id = "..."`) — the GitHub web editor is
-     fine. The id is an identifier, not a secret: it's useless without
-     authenticated access to your Cloudflare account, so it's safe in a
-     public repo (Cloudflare's own templates commit KV ids).
-   - *Keep it out of the repo*: leave the placeholder and substitute at
-     build time. In the Worker's build settings (Settings → Build), set
-     the **Build command** to
+   **Namespace ID** (a 32-char hex string).
+2. **Put the id into `wrangler.toml`** — pick one:
+   - *Commit it (simplest)*: edit `worker/wrangler.toml`, replace
+     `<REPLACE_WITH_KV_NAMESPACE_ID>` under `[[kv_namespaces]]` with the id,
+     and commit — the GitHub web editor is fine. The id is an identifier,
+     not a secret: it's useless without authenticated access to your
+     Cloudflare account, so it's safe in a public repo (Cloudflare's own
+     templates commit KV ids).
+   - *Keep it out of the repo*: leave the placeholder in the file and
+     substitute it at build time. In the Worker's build settings
+     (Settings → Build → Build command) put
      `sed -i "s|<REPLACE_WITH_KV_NAMESPACE_ID>|$OAUTH_KV_NAMESPACE_ID|" wrangler.toml`
-     and add a **build variable** `OAUTH_KV_NAMESPACE_ID` with the id as
-     its value. (`wrangler.toml` can't interpolate env vars itself, so
-     the substitution happens just before deploy.)
+     and add a **build variable** (Settings → Build) named
+     `OAUTH_KV_NAMESPACE_ID` set to the id. (`wrangler.toml` can't read env
+     vars itself; the `sed` rewrites the file just before `wrangler deploy`
+     runs. Note this is a *build* variable, distinct from the runtime
+     Variables and Secrets in step 4.)
 3. **Connect the repo**: Workers & Pages → Create → Workers → Import a
-   repository → pick this repo, and set **Root Directory = `worker`**.
-   The defaults (build command `npx wrangler deploy`) are correct. The
-   first build creates the Worker and the Durable Object migration.
-4. **Set variables and secrets**: Worker → Settings → Variables and
-   Secrets:
-   - Plain text: `ALLOWED_GITHUB_USER` = your GitHub username,
+   repository → pick this repo, and set **Root Directory = `worker`** (under
+   Advanced / Build configuration). Leave the build command empty and the
+   deploy command as the default `npx wrangler deploy`. This first build
+   creates the Worker, the KV binding, and the Durable Object migration.
+   Uncheck "Builds for non-production branches" unless you want preview
+   deploys on every branch.
+4. **Set the runtime variables and secrets**: Worker → Settings → Variables
+   and Secrets (these are what `keep_vars` preserves):
+   - Plain text: `ALLOWED_GITHUB_USER` = your GitHub username;
      `INTERNAL_SERVICE_URL` = `https://lightsail-internal.<yourdomain>.com`
-   - Secrets: `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` (step 4),
-     `ACCESS_CLIENT_ID`, `ACCESS_CLIENT_SECRET` (step 3), and
-     `COOKIE_ENCRYPTION_KEY` (any long random string, e.g. from
-     `openssl rand -hex 32`).
+     — the scheme **must be `https://`**, not `http://` (plain http won't
+     route through the tunnel and the tool calls 404).
+   - Secrets: `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` (step 4 above),
+     `ACCESS_CLIENT_ID`, `ACCESS_CLIENT_SECRET` (step 3, the same values as
+     the box's `.env`), and `COOKIE_ENCRYPTION_KEY` (any long random string,
+     e.g. `openssl rand -hex 32`). Paste secrets carefully — a trailing
+     space or newline makes the token silently mismatch.
 
-   Until all seven are set, the Worker responds with a message listing
+   Until all seven are set, the Worker replies with a message listing
    exactly which ones are missing rather than failing cryptically.
-5. **Redeploy** so the new settings apply (Deployments → retry latest, or
-   just push any commit).
+5. **Redeploy** so the new variables take effect (Deployments → retry latest,
+   or push any commit). Dashboard variable changes only apply to *new*
+   deployments.
 6. **Custom domain**: Worker → Settings → Domains & Routes → Add →
-   Custom domain → `mcp-ssh.<yourdomain>.com`.
+   Custom domain → `mcp-ssh.<yourdomain>.com`. This must match the domain in
+   your GitHub OAuth app's callback URL (step 4).
+
+> **When you change `wrangler.toml` later** (e.g. a new binding), just commit
+> and push — Workers Builds redeploys automatically. **When you change a
+> variable or secret**, edit it in the dashboard and redeploy; don't put it
+> in `wrangler.toml`.
 
 ### 6. Connect Claude
 
