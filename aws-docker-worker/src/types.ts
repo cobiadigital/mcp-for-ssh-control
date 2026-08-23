@@ -14,14 +14,35 @@ export interface Env extends Cloudflare.Env {
 
   // --- plain text variables (dashboard-managed, keep_vars = true) ---
   ALLOWED_GITHUB_USER: string;
-  INTERNAL_SERVICE_URL: string;
+
+  /**
+   * The fleet: a JSON object mapping an alias to each server this Worker can
+   * control (see servers.ts for the accepted shapes). Optional — when it is
+   * unset the Worker falls back to the single INTERNAL_SERVICE_URL below.
+   * Store it as a secret rather than a plain variable if you put per-server
+   * Access credentials inside it.
+   */
+  SERVERS?: string;
+
+  /**
+   * Single-server configuration, kept for deployments that predate SERVERS.
+   * Ignored when SERVERS is set.
+   */
+  INTERNAL_SERVICE_URL?: string;
 
   // --- secrets (dashboard-managed) ---
   GITHUB_CLIENT_ID: string;
   GITHUB_CLIENT_SECRET: string;
   COOKIE_ENCRYPTION_KEY: string;
-  ACCESS_CLIENT_ID: string;
-  ACCESS_CLIENT_SECRET: string;
+
+  /**
+   * Cloudflare Access service token used for every server that doesn't carry
+   * its own credentials in SERVERS. Optional only in the sense that a fleet
+   * can override it per server; without either, tool calls fail with a clear
+   * message.
+   */
+  ACCESS_CLIENT_ID?: string;
+  ACCESS_CLIENT_SECRET?: string;
 
   /**
    * Injected automatically by OAuthProvider into the default handler's env.
@@ -31,20 +52,22 @@ export interface Env extends Cloudflare.Env {
 }
 
 /**
- * Everything above except OAUTH_PROVIDER is dashboard-managed and therefore
- * can be missing on a fresh deploy. Callers use this to fail with a clear
+ * The login half of the configuration: everything the OAuth flow and the
+ * single-user allowlist need. All of it is dashboard-managed and therefore
+ * can be missing on a fresh deploy, so callers use this to fail with a clear
  * message instead of a confusing downstream error.
+ *
+ * Which servers the Worker talks to is checked separately, by
+ * parseServers()/resolveTarget() in servers.ts — a fleet misconfiguration
+ * shouldn't stop you logging in and seeing the error reported by the tools.
  */
 export function missingConfig(env: Env): string[] {
   return (
     [
       "ALLOWED_GITHUB_USER",
-      "INTERNAL_SERVICE_URL",
       "GITHUB_CLIENT_ID",
       "GITHUB_CLIENT_SECRET",
       "COOKIE_ENCRYPTION_KEY",
-      "ACCESS_CLIENT_ID",
-      "ACCESS_CLIENT_SECRET",
     ] as const
   ).filter((key) => !env[key]);
 }

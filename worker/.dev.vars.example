@@ -2,9 +2,21 @@
 # In production these are all set in the dashboard (Settings → Variables
 # and Secrets), not here.
 ALLOWED_GITHUB_USER=your-github-username
-INTERNAL_SERVICE_URL=https://lightsail-internal.example.com
 GITHUB_CLIENT_ID=your-github-oauth-app-client-id
 GITHUB_CLIENT_SECRET=your-github-oauth-app-client-secret
 COOKIE_ENCRYPTION_KEY=any-long-random-string
+
+# Cloudflare Access service token, used for every server that doesn't set
+# its own credentials in SERVERS below.
 ACCESS_CLIENT_ID=xxxxxxxx.access
 ACCESS_CLIENT_SECRET=xxxxxxxx
+
+# The fleet: a JSON object mapping an alias to each server this Worker
+# controls. The alias is what you pass as the `server` argument of a tool.
+# An entry is either a bare https URL or an object with `url` plus optional
+# `description`, `access_client_id` and `access_client_secret`.
+SERVERS={"lightsail":"https://lightsail-internal.example.com","aws-docker":{"url":"https://aws-docker-internal.example.com","description":"Docker host"}}
+
+# Single-server alternative, kept for deployments that predate SERVERS.
+# Ignored when SERVERS is set; with it, tools take no `server` argument.
+#INTERNAL_SERVICE_URL=https://lightsail-internal.example.com

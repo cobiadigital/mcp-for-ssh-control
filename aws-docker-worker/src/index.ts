@@ -4,12 +4,18 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { GitHubHandler } from "./github-handler";
 import { missingConfig, type Env, type Props } from "./types";
+import {
+  parseServers,
+  resolveTarget,
+  serverArgDescription,
+  type ServerTarget,
+} from "./servers";
 
 /**
- * How long we wait for the internal service (through the Cloudflare Tunnel)
- * before giving up. If the tunnel or the Lightsail box is down, requests
- * would otherwise hang until the Workers runtime kills them — instead we
- * abort and return a readable MCP tool error.
+ * How long we wait for an internal service (through its Cloudflare Tunnel)
+ * before giving up. If the tunnel or the box itself is down, requests would
+ * otherwise hang until the Workers runtime kills them — instead we abort and
+ * return a readable MCP tool error.
  */
 const INTERNAL_FETCH_TIMEOUT_MS = 20_000;
 
@@ -29,31 +35,22 @@ function err(text: string): ToolResult {
 }
 
 /**
- * Forward one whitelisted command to the internal service on the Lightsail
- * box. The service only understands `POST /run {command, args}` and requires
- * the Cloudflare Access service-token headers on every request.
+ * Forward one whitelisted command to the internal service on `target`. Each
+ * service only understands `POST /run {command, args}` and requires the
+ * Cloudflare Access service-token headers on every request.
  */
 async function callInternal(
-  env: Env,
+  target: ServerTarget,
   command: string,
   args: Record<string, unknown> = {}
 ): Promise<ToolResult> {
-  // Vars/secrets are managed in the dashboard (Settings → Variables and
-  // Secrets), so a fresh deploy can be missing them — say so explicitly.
-  const missing = missingConfig(env);
-  if (missing.length > 0) {
-    return err(
-      `Worker is not fully configured — set these in the Cloudflare dashboard ` +
-        `(Worker → Settings → Variables and Secrets): ${missing.join(", ")}`
-    );
-  }
-
-  const url = `${env.INTERNAL_SERVICE_URL.replace(/\/$/, "")}/run`;
+  const url = `${target.url}/run`;
   // Diagnostic logging — visible in the Worker's real-time logs. Lets us see
   // whether the internal-service hop succeeds, errors, or times out without
-  // having to guess from the MCP transport churn.
+  // having to guess from the MCP transport churn. The alias is included
+  // because one Worker now fans out to several boxes.
   const startedAt = Date.now();
-  console.log(`callInternal → ${command} POST ${url}`);
+  console.log(`callInternal → [${target.alias}] ${command} POST ${url}`);
   let res: Response;
   try {
     res = await fetch(url, {
@@ -65,10 +62,10 @@ async function callInternal(
         // CONSUMES those headers (the origin never sees them). The
         // X-Internal-* pair passes through Access untouched so the internal
         // service can re-check the token itself as defense in depth.
-        "CF-Access-Client-Id": env.ACCESS_CLIENT_ID,
-        "CF-Access-Client-Secret": env.ACCESS_CLIENT_SECRET,
-        "X-Internal-Client-Id": env.ACCESS_CLIENT_ID,
-        "X-Internal-Client-Secret": env.ACCESS_CLIENT_SECRET,
+        "CF-Access-Client-Id": target.accessClientId,
+        "CF-Access-Client-Secret": target.accessClientSecret,
+        "X-Internal-Client-Id": target.accessClientId,
+        "X-Internal-Client-Secret": target.accessClientSecret,
       },
       body: JSON.stringify({ command, args }),
       signal: AbortSignal.timeout(INTERNAL_FETCH_TIMEOUT_MS),
@@ -78,19 +75,19 @@ async function callInternal(
     // anything else is a connection-level failure (tunnel down, DNS, TLS).
     const isTimeout = e instanceof DOMException && e.name === "TimeoutError";
     console.log(
-      `callInternal ✗ ${command} ${isTimeout ? "TIMEOUT" : "FETCH-ERROR"} after ${Date.now() - startedAt}ms: ${e instanceof Error ? e.message : String(e)}`
+      `callInternal ✗ [${target.alias}] ${command} ${isTimeout ? "TIMEOUT" : "FETCH-ERROR"} after ${Date.now() - startedAt}ms: ${e instanceof Error ? e.message : String(e)}`
     );
     return err(
       isTimeout
-        ? `Timed out after ${INTERNAL_FETCH_TIMEOUT_MS / 1000}s waiting for the Lightsail internal service. ` +
-            `The Cloudflare Tunnel or the server itself may be down.`
-        : `Could not reach the Lightsail internal service: ${e instanceof Error ? e.message : String(e)}`
+        ? `Timed out after ${INTERNAL_FETCH_TIMEOUT_MS / 1000}s waiting for the internal service on "${target.alias}". ` +
+            `Its Cloudflare Tunnel or the server itself may be down.`
+        : `Could not reach the internal service on "${target.alias}": ${e instanceof Error ? e.message : String(e)}`
     );
   }
 
   const text = await res.text();
   console.log(
-    `callInternal ← ${command} HTTP ${res.status} in ${Date.now() - startedAt}ms (${text.length} bytes)`
+    `callInternal ← [${target.alias}] ${command} HTTP ${res.status} in ${Date.now() - startedAt}ms (${text.length} bytes)`
   );
   if (!res.ok) {
     // The internal service returns JSON {error} for auth/whitelist/exec
@@ -103,7 +100,7 @@ async function callInternal(
     } catch {
       if (text.includes("<html")) detail = "(blocked before reaching the internal service — check the Access service token policy)";
     }
-    return err(`Internal service returned HTTP ${res.status} for "${command}": ${detail}`);
+    return err(`Internal service on "${target.alias}" returned HTTP ${res.status} for "${command}": ${detail}`);
   }
 
   try {
@@ -121,30 +118,90 @@ async function callInternal(
  * time a session reaches this class, OAuthProvider has already verified the
  * bearer token, and the OAuth flow only ever issues tokens to the single
  * allowlisted GitHub user.
+ *
+ * One Worker fronts a fleet: every tool takes an optional `server` argument
+ * naming which configured machine to act on (see servers.ts). With a single
+ * server configured the argument can be omitted, so an existing single-box
+ * deployment behaves exactly as it did before.
  */
 export class LightsailMCP extends McpAgent<Env, Record<string, never>, Props> {
   server = new McpServer({
-    name: "Lightsail Server Control",
-    version: "1.0.0",
+    name: "Remote Server Control",
+    version: "1.1.0",
   });
 
+  /**
+   * Resolve the requested server and run one command on it. Configuration
+   * problems come back as tool errors rather than exceptions so the model can
+   * read them and, for an unknown alias, retry with a valid one.
+   */
+  private async run(
+    server: string | undefined,
+    command: string,
+    args: Record<string, unknown> = {}
+  ): Promise<ToolResult> {
+    // Vars/secrets are managed in the dashboard (Settings → Variables and
+    // Secrets), so a fresh deploy can be missing them — say so explicitly.
+    const missing = missingConfig(this.env);
+    if (missing.length > 0) {
+      return err(
+        `Worker is not fully configured — set these in the Cloudflare dashboard ` +
+          `(Worker → Settings → Variables and Secrets): ${missing.join(", ")}`
+      );
+    }
+
+    const target = resolveTarget(this.env, server);
+    if (!target.ok) return err(target.error);
+    return callInternal(target.value, command, args);
+  }
+
   async init() {
+    // Read once per session: the Durable Object restarts on deploy, so a
+    // configuration change is picked up with the next session anyway, and
+    // this lets the `server` argument advertise the real aliases in its
+    // schema instead of making the model call list_servers first.
+    const config = parseServers(this.env);
+
+    const serverArg = {
+      server: z.string().optional().describe(serverArgDescription(config)),
+    };
+
     const containerArg = {
       container: z
         .string()
         .regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/, "invalid container name")
-        .describe("Container name (must be on the server's allowlist)"),
+        .describe("Container name (must be on the target server's allowlist)"),
     };
+
+    this.server.registerTool(
+      "list_servers",
+      {
+        title: "List servers",
+        description:
+          "List the servers this MCP server can control. Use an alias from here as the `server` argument of the other tools.",
+        inputSchema: {},
+      },
+      async () => {
+        if (!config.ok) return err(config.error);
+        const lines = config.value.map(
+          (t) => `${t.alias}\t${t.url}${t.description ? `\t${t.description}` : ""}`
+        );
+        return ok(
+          `${config.value.length} server(s) configured (alias, internal URL, description):\n` +
+            lines.join("\n")
+        );
+      }
+    );
 
     this.server.registerTool(
       "docker_ps",
       {
         title: "List Docker containers",
         description:
-          "List all Docker containers on the Lightsail server with their status and ports.",
-        inputSchema: {},
+          "List all Docker containers on the target server with their status and ports.",
+        inputSchema: serverArg,
       },
-      async () => callInternal(this.env, "docker_ps")
+      async ({ server }) => this.run(server, "docker_ps")
     );
 
     this.server.registerTool(
@@ -152,8 +209,9 @@ export class LightsailMCP extends McpAgent<Env, Record<string, never>, Props> {
       {
         title: "Tail Docker logs",
         description:
-          "Tail the logs of an allowlisted Docker container on the Lightsail server.",
+          "Tail the logs of an allowlisted Docker container on the target server.",
         inputSchema: {
+          ...serverArg,
           ...containerArg,
           lines: z
             .number()
@@ -164,8 +222,8 @@ export class LightsailMCP extends McpAgent<Env, Record<string, never>, Props> {
             .describe("Number of log lines to return (default 50, max 1000)"),
         },
       },
-      async ({ container, lines }) =>
-        callInternal(this.env, "docker_logs", { container, lines })
+      async ({ server, container, lines }) =>
+        this.run(server, "docker_logs", { container, lines })
     );
 
     this.server.registerTool(
@@ -173,31 +231,31 @@ export class LightsailMCP extends McpAgent<Env, Record<string, never>, Props> {
       {
         title: "Restart Docker container",
         description:
-          "Restart an allowlisted Docker container on the Lightsail server.",
-        inputSchema: containerArg,
+          "Restart an allowlisted Docker container on the target server.",
+        inputSchema: { ...serverArg, ...containerArg },
       },
-      async ({ container }) =>
-        callInternal(this.env, "docker_restart", { container })
+      async ({ server, container }) =>
+        this.run(server, "docker_restart", { container })
     );
 
     this.server.registerTool(
       "disk_usage",
       {
         title: "Disk usage",
-        description: "Show filesystem disk usage on the Lightsail server (df -h).",
-        inputSchema: {},
+        description: "Show filesystem disk usage on the target server (df -h).",
+        inputSchema: serverArg,
       },
-      async () => callInternal(this.env, "disk_usage")
+      async ({ server }) => this.run(server, "disk_usage")
     );
 
     this.server.registerTool(
       "memory_usage",
       {
         title: "Memory usage",
-        description: "Show memory usage on the Lightsail server (free -h).",
-        inputSchema: {},
+        description: "Show memory usage on the target server (free -h).",
+        inputSchema: serverArg,
       },
-      async () => callInternal(this.env, "memory_usage")
+      async ({ server }) => this.run(server, "memory_usage")
     );
 
     this.server.registerTool(
@@ -205,37 +263,38 @@ export class LightsailMCP extends McpAgent<Env, Record<string, never>, Props> {
       {
         title: "Systemd service status",
         description:
-          "Show systemctl status for an allowlisted service (e.g. nginx, docker, cloudflared).",
+          "Show systemctl status for an allowlisted service on the target server (e.g. nginx, docker, cloudflared).",
         inputSchema: {
+          ...serverArg,
           service: z
             .string()
             .regex(/^[a-zA-Z0-9][a-zA-Z0-9_.@-]*$/, "invalid service name")
-            .describe("Systemd service name (must be on the server's allowlist)"),
+            .describe("Systemd service name (must be on the target server's allowlist)"),
         },
       },
-      async ({ service }) => callInternal(this.env, "service_status", { service })
+      async ({ server, service }) => this.run(server, "service_status", { service })
     );
 
     this.server.registerTool(
       "uptime",
       {
         title: "Server uptime",
-        description: "Show the Lightsail server's uptime and load averages.",
-        inputSchema: {},
+        description: "Show the target server's uptime and load averages.",
+        inputSchema: serverArg,
       },
-      async () => callInternal(this.env, "uptime")
+      async ({ server }) => this.run(server, "uptime")
     );
 
     // --- File and script tools ---------------------------------------------
-    // These only work inside the directory roots configured on the box via
+    // These only work inside the directory roots configured on each box via
     // ALLOWED_PATHS; anything outside (or any path when ALLOWED_PATHS is
-    // unset) is rejected by the internal service.
+    // unset) is rejected by that server's internal service.
 
     const pathArg = z
       .string()
       .startsWith("/", "path must be absolute")
       .describe(
-        "Absolute path on the server. Must be inside one of the server's ALLOWED_PATHS roots."
+        "Absolute path on the target server. Must be inside one of that server's ALLOWED_PATHS roots."
       );
 
     this.server.registerTool(
@@ -243,10 +302,10 @@ export class LightsailMCP extends McpAgent<Env, Record<string, never>, Props> {
       {
         title: "List directory",
         description:
-          "List the entries of a directory on the Lightsail server (type, size, mtime, name).",
-        inputSchema: { path: pathArg },
+          "List the entries of a directory on the target server (type, size, mtime, name).",
+        inputSchema: { ...serverArg, path: pathArg },
       },
-      async ({ path }) => callInternal(this.env, "list_directory", { path })
+      async ({ server, path }) => this.run(server, "list_directory", { path })
     );
 
     this.server.registerTool(
@@ -254,10 +313,10 @@ export class LightsailMCP extends McpAgent<Env, Record<string, never>, Props> {
       {
         title: "Read file",
         description:
-          "Read a text file on the Lightsail server (truncated past 512KB).",
-        inputSchema: { path: pathArg },
+          "Read a text file on the target server (truncated past 512KB).",
+        inputSchema: { ...serverArg, path: pathArg },
       },
-      async ({ path }) => callInternal(this.env, "read_file", { path })
+      async ({ server, path }) => this.run(server, "read_file", { path })
     );
 
     this.server.registerTool(
@@ -265,14 +324,15 @@ export class LightsailMCP extends McpAgent<Env, Record<string, never>, Props> {
       {
         title: "Write file",
         description:
-          "Create or overwrite a text file on the Lightsail server with the given content (max 512KB). The parent directory must already exist.",
+          "Create or overwrite a text file on the target server with the given content (max 512KB). The parent directory must already exist.",
         inputSchema: {
+          ...serverArg,
           path: pathArg,
           content: z.string().describe("Full file content to write"),
         },
       },
-      async ({ path, content }) =>
-        callInternal(this.env, "write_file", { path, content })
+      async ({ server, path, content }) =>
+        this.run(server, "write_file", { path, content })
     );
 
     this.server.registerTool(
@@ -280,8 +340,9 @@ export class LightsailMCP extends McpAgent<Env, Record<string, never>, Props> {
       {
         title: "Edit file",
         description:
-          "Edit a text file on the Lightsail server by exact string replacement. old_string must match exactly once unless replace_all is set.",
+          "Edit a text file on the target server by exact string replacement. old_string must match exactly once unless replace_all is set.",
         inputSchema: {
+          ...serverArg,
           path: pathArg,
           old_string: z.string().min(1).describe("Exact text to find"),
           new_string: z.string().describe("Replacement text"),
@@ -291,8 +352,8 @@ export class LightsailMCP extends McpAgent<Env, Record<string, never>, Props> {
             .describe("Replace every occurrence instead of requiring a unique match"),
         },
       },
-      async ({ path, old_string, new_string, replace_all }) =>
-        callInternal(this.env, "edit_file", { path, old_string, new_string, replace_all })
+      async ({ server, path, old_string, new_string, replace_all }) =>
+        this.run(server, "edit_file", { path, old_string, new_string, replace_all })
     );
 
     this.server.registerTool(
@@ -300,10 +361,10 @@ export class LightsailMCP extends McpAgent<Env, Record<string, never>, Props> {
       {
         title: "Check script syntax",
         description:
-          "Diagnose a script on the Lightsail server without running it: bash -n / sh -n (plus shellcheck when installed) for shell, python3 -m py_compile for Python, node --check for JavaScript. Interpreter is detected from the shebang or file extension.",
-        inputSchema: { path: pathArg },
+          "Diagnose a script on the target server without running it: bash -n / sh -n (plus shellcheck when installed) for shell, python3 -m py_compile for Python, node --check for JavaScript. Interpreter is detected from the shebang or file extension.",
+        inputSchema: { ...serverArg, path: pathArg },
       },
-      async ({ path }) => callInternal(this.env, "check_script", { path })
+      async ({ server, path }) => this.run(server, "check_script", { path })
     );
 
     this.server.registerTool(
@@ -311,8 +372,9 @@ export class LightsailMCP extends McpAgent<Env, Record<string, never>, Props> {
       {
         title: "Run script",
         description:
-          "Execute a script on the Lightsail server (bash/sh/python3/node, detected from shebang or extension) and return its exit code and output. Use for diagnosing script behavior.",
+          "Execute a script on the target server (bash/sh/python3/node, detected from shebang or extension) and return its exit code and output. Use for diagnosing script behavior.",
         inputSchema: {
+          ...serverArg,
           path: pathArg,
           args: z
             .array(z.string().max(256))
@@ -328,8 +390,8 @@ export class LightsailMCP extends McpAgent<Env, Record<string, never>, Props> {
             .describe("Kill the script after this many seconds (default 30, max 120)"),
         },
       },
-      async ({ path, args, timeout_seconds }) =>
-        callInternal(this.env, "run_script", { path, args, timeout_seconds })
+      async ({ server, path, args, timeout_seconds }) =>
+        this.run(server, "run_script", { path, args, timeout_seconds })
     );
   }
 }
