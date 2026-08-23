@@ -257,7 +257,7 @@ the live Worker to match. That split matters:
 
 | Lives in `wrangler.toml` (committed) | Lives in the dashboard (never committed) |
 |---|---|
-| Worker name, `main`, compatibility flags | Plain-text variables (`ALLOWED_GITHUB_USER`, `INTERNAL_SERVICE_URL`) |
+| Worker name, `main`, compatibility flags | Plain-text variables (`ALLOWED_GITHUB_USER`, `SERVERS`) |
 | Durable Object binding + migration (`MCP_OBJECT`) | Secrets (`GITHUB_*`, `ACCESS_*`, `COOKIE_ENCRYPTION_KEY`) |
 | KV binding name + **namespace id** (`OAUTH_KV`) | — |
 
