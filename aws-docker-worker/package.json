@@ -2,7 +2,7 @@
   "name": "lightsail-mcp-worker",
   "version": "1.0.0",
   "private": true,
-  "description": "Remote MCP server (Cloudflare Worker) that controls a Lightsail box through a Cloudflare Tunnel",
+  "description": "Remote MCP server (Cloudflare Worker) that controls one or more boxes through Cloudflare Tunnels",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",

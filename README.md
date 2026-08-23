@@ -1,9 +1,15 @@
-# Lightsail Server Control via Remote MCP
+# Server Control via Remote MCP
 
-Manage a Lightsail server — Docker containers, disk/memory checks, service
+Manage one or more servers — Docker containers, disk/memory checks, service
 status, file editing, and script diagnosis — from Claude (mobile app,
 claude.ai, or Claude Code) as a custom MCP connector, **with no inbound ports
-opened on the server**.
+opened on the servers**.
+
+A single Worker can front a whole fleet: each machine gets a short alias, and
+every tool takes an optional `server` argument choosing which one to act on.
+See [Multiple servers](#multiple-servers). With one server configured the
+argument can be omitted entirely, so a single-box setup looks exactly like it
+always did.
 
 ## Architecture
 
@@ -11,17 +17,22 @@ opened on the server**.
 Claude (any client)
    → HTTPS → Cloudflare Worker (mcp-ssh.<yourdomain>.com)
         - Auth: GitHub OAuth, restricted to ONE allowlisted GitHub username
-        - Implements the MCP tools (docker_ps, docker_logs, docker_restart,
-          disk_usage, memory_usage, service_status, uptime, plus file and
-          script tools: list_directory, read_file, write_file, edit_file,
-          check_script, run_script)
-        - Forwards each tool call over HTTPS, authenticated with a
-          Cloudflare Access service token
-   → Cloudflare Tunnel (outbound-only from the Lightsail box)
-   → Internal service on the Lightsail box (127.0.0.1:8787)
+        - Implements the MCP tools (list_servers, docker_ps, docker_logs,
+          docker_restart, disk_usage, memory_usage, service_status, uptime,
+          plus file and script tools: list_directory, read_file, write_file,
+          edit_file, check_script, run_script)
+        - Picks a target server from the call's `server` argument and the
+          SERVERS configuration, then forwards the call over HTTPS,
+          authenticated with a Cloudflare Access service token
+   → Cloudflare Tunnel (outbound-only from each box)
+   → Internal service on each box (127.0.0.1:8787)
         - Re-validates the Access service token on every request
         - Executes ONLY whitelisted commands (never arbitrary shell)
         - Container/service names checked against explicit allowlists
+
+                      ┌→ tunnel → box "lightsail"   (its own allowlists)
+   one Worker ────────┤
+                      └→ tunnel → box "aws-docker"  (its own allowlists)
 ```
 
 Security properties this design preserves:
@@ -59,10 +70,14 @@ Security properties this design preserves:
 ```
 worker/                — Cloudflare Worker (deploy via Workers Builds or wrangler)
   src/index.ts            — OAuthProvider entrypoint + MCP agent + tool definitions
+  src/servers.ts          — parses SERVERS, resolves a tool call's target box
   src/github-handler.ts   — GitHub OAuth flow with single-user allowlist
   src/workers-oauth-utils.ts — client-approval dialog + signed cookie helpers
   wrangler.toml
-internal-service/      — runs on the Lightsail box (deployed manually)
+aws-docker-worker/     — an identical copy of worker/, kept only for an older
+                         one-Worker-per-server deployment (see Multiple
+                         servers → Consolidating). Not needed for new setups.
+internal-service/      — runs on each box (deployed manually)
   server.js               — Express app, whitelist-only command execution
   smoke-test.sh           — curl-based auth/whitelist verification
   lightsail-mcp-internal.service.example — systemd unit template
@@ -291,18 +306,29 @@ Then, in order:
    deploys on every branch.
 4. **Set the runtime variables and secrets**: Worker → Settings → Variables
    and Secrets (these are what `keep_vars` preserves):
-   - Plain text: `ALLOWED_GITHUB_USER` = your GitHub username;
-     `INTERNAL_SERVICE_URL` = `https://lightsail-internal.<yourdomain>.com`
-     — the scheme **must be `https://`**, not `http://` (plain http won't
-     route through the tunnel and the tool calls 404).
+   - Plain text: `ALLOWED_GITHUB_USER` = your GitHub username; `SERVERS` =
+     the JSON fleet map, e.g.
+     `{"lightsail":"https://lightsail-internal.<yourdomain>.com"}` — each URL
+     **must be `https://`**, not `http://` (plain http won't route through
+     the tunnel and the tool calls 404). See
+     [Multiple servers](#multiple-servers) for the full shape; make `SERVERS`
+     a *secret* instead of a plain variable if you give a server its own
+     Access credentials inside it.
    - Secrets: `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` (step 4 above),
      `ACCESS_CLIENT_ID`, `ACCESS_CLIENT_SECRET` (step 3, the same values as
      the box's `.env`), and `COOKIE_ENCRYPTION_KEY` (any long random string,
      e.g. `openssl rand -hex 32`). Paste secrets carefully — a trailing
      space or newline makes the token silently mismatch.
 
-   Until all seven are set, the Worker replies with a message listing
-   exactly which ones are missing rather than failing cryptically.
+   Until `ALLOWED_GITHUB_USER`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`
+   and `COOKIE_ENCRYPTION_KEY` are set, the Worker refuses to serve the login
+   flow and says exactly which ones are missing. Server configuration is
+   checked separately, when a tool runs — so you can always log in and let a
+   tool call tell you what's wrong with `SERVERS`.
+
+   > Older deployments set `INTERNAL_SERVICE_URL` to a single URL instead of
+   > `SERVERS`. That still works and needs no change: the Worker falls back
+   > to it whenever `SERVERS` is unset.
 5. **Redeploy** so the new variables take effect (Deployments → retry latest,
    or push any commit). Dashboard variable changes only apply to *new*
    deployments.
@@ -331,8 +357,15 @@ account other than `ALLOWED_GITHUB_USER` gets a 403 and no token.
 
 ## Tools
 
+Every tool below also takes an optional **`server`** argument: the alias of
+the machine to act on, from your `SERVERS` configuration. It is required when
+more than one server is configured and can be omitted when there is only one.
+The configured aliases appear in the argument's description, so Claude can
+pick one without asking.
+
 | Tool | Arguments | Runs on the box |
 |---|---|---|
+| `list_servers` | — | nothing — returns the configured aliases, URLs and descriptions |
 | `docker_ps` | — | `docker ps -a` (names/status/ports) |
 | `docker_logs` | `container`, `lines?` (1–1000) | `docker logs --tail N <name>` |
 | `docker_restart` | `container` | `docker restart <name>` |
@@ -347,9 +380,78 @@ account other than `ALLOWED_GITHUB_USER` gets a 403 and no token.
 | `check_script` | `path` | syntax check without running: `bash -n`/`sh -n` (+ `shellcheck` if installed), `python3 -m py_compile`, `node --check` |
 | `run_script` | `path`, `args?` (≤16), `timeout_seconds?` (1–120) | run a script via bash/sh/python3/node (from shebang or extension); returns exit code + output |
 
-`container` / `service` arguments must be on the box's allowlists, and every
-`path` must be inside one of the `ALLOWED_PATHS` roots (the file/script tools
-return 403 until `ALLOWED_PATHS` is configured).
+`container` / `service` arguments must be on the target box's allowlists, and
+every `path` must be inside one of that box's `ALLOWED_PATHS` roots (the
+file/script tools return 403 until `ALLOWED_PATHS` is configured). Allowlists
+are per box: each internal service has its own `.env`, so a container name
+valid on one server is not automatically valid on another.
+
+## Multiple servers
+
+One Worker controls a fleet. Each machine runs its own copy of
+`internal-service/` behind its own Cloudflare Tunnel and Access policy; the
+Worker just needs to know how to reach each one.
+
+### Adding a server
+
+1. **On the new box**, do steps 1–3 of the deployment walkthrough: install the
+   internal service, create a tunnel hostname for it (e.g.
+   `aws-docker-internal.<yourdomain>.com`), and put an Access policy on that
+   hostname. The existing Access **service token can be reused** — add it to
+   the new hostname's policy — or issue a separate one for stricter blast
+   radius.
+2. **In the Worker** (Settings → Variables and Secrets), add the box to
+   `SERVERS`:
+
+   ```json
+   {
+     "lightsail": "https://lightsail-internal.example.com",
+     "aws-docker": {
+       "url": "https://aws-docker-internal.example.com",
+       "description": "Docker host"
+     }
+   }
+   ```
+
+   An entry is either a bare `https://` URL or an object with:
+
+   | Field | Required | Meaning |
+   |---|---|---|
+   | `url` | yes | the tunnel hostname of that box's internal service |
+   | `description` | no | shown to Claude next to the alias, e.g. "prod web" |
+   | `access_client_id` | no | per-server Access service token id (defaults to the Worker's `ACCESS_CLIENT_ID`) |
+   | `access_client_secret` | no | per-server Access service token secret (defaults to `ACCESS_CLIENT_SECRET`) |
+
+   Aliases are what Claude types, so keep them short: letters, digits, `-`
+   and `_`, up to 32 characters. If any entry carries its own
+   `access_client_*`, store `SERVERS` as a **secret** rather than a plain
+   text variable.
+3. **Redeploy** (Deployments → retry latest, or push any commit) — dashboard
+   variable changes only apply to new deployments. Reconnect or refresh the
+   connector in Claude so it re-reads the tool schemas; the new alias then
+   shows up in `list_servers` and in the `server` argument description.
+
+No new Worker, KV namespace, GitHub OAuth app, custom domain, or build
+configuration is involved — adding a box is one JSON entry plus its tunnel.
+
+### Consolidating an existing per-server Worker
+
+Earlier the only way to reach a second box was to deploy the same code again
+as a second Worker (that's what `aws-docker-worker/` is — a copy of `worker/`
+with a different `wrangler.toml`). With `SERVERS` that's no longer needed. To
+fold a second Worker back into the first:
+
+1. Add the second box to `SERVERS` on the **first** Worker, redeploy, and
+   confirm `list_servers` shows both and a tool call against the new alias
+   works.
+2. Remove the second Worker's connector from Claude.
+3. Delete the second Worker in the Cloudflare dashboard, along with its KV
+   namespace and its GitHub OAuth app, then delete `aws-docker-worker/` from
+   this repo.
+
+Do it in that order — deleting the folder first breaks the second Worker's
+builds while it's still serving. Until then the copy is kept byte-identical
+to `worker/src`, so both Workers behave the same.
 
 ## Development
 
@@ -365,13 +467,25 @@ whenever `wrangler.toml` bindings change.
 
 ## Troubleshooting
 
-- **Tool calls return "Timed out ... waiting for the Lightsail internal
-  service"** — the tunnel or the box is down. Check
+- **Tool calls return "Timed out ... waiting for the internal service on
+  ..."** — that box's tunnel or the box itself is down. Check
   `systemctl status cloudflared` and `systemctl status lightsail-mcp-internal`
-  on the box. The Worker aborts after 20s rather than hanging.
+  on it. The Worker aborts after 20s rather than hanging.
+- **`This MCP server controls N machines — pass "server" with one of: ...`**
+  — the call left `server` out while more than one is configured. Name the
+  alias (`list_servers` shows them all).
+- **`Unknown server "x"`** — the alias isn't in `SERVERS`. Note that adding
+  one requires a redeploy, and Claude may need the connector refreshed before
+  it sees the new alias.
+- **`SERVERS is not valid JSON`** — the variable has to be a single-line JSON
+  object; a stray trailing comma or a smart quote from copy-paste is the
+  usual cause. Removing `SERVERS` entirely falls back to
+  `INTERNAL_SERVICE_URL`.
 - **Tool calls return "blocked before reaching the internal service"** — the
-  Worker's `ACCESS_CLIENT_ID/SECRET` secrets don't match the Access policy on
-  the tunnel hostname. Re-check step 3 and the Worker secrets.
+  credentials used for that server don't match the Access policy on its
+  tunnel hostname. Re-check step 3 and the Worker secrets; with several boxes,
+  confirm the shared service token is on *that* hostname's policy (or give the
+  server its own `access_client_id`/`access_client_secret` in `SERVERS`).
 - **"Access denied: GitHub user ... is not authorized"** — you logged into
   GitHub with the wrong account, or `ALLOWED_GITHUB_USER` in `wrangler.toml`
   doesn't match your username.
