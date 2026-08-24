@@ -277,6 +277,16 @@ for the box's own re-check.
 
 [auth-docs]: https://developers.cloudflare.com/cloudflare-one/access-controls/ai-controls/mcp-portals/#bearer-authentication-credentials
 
+`CLOUDFLARE_API_TOKEN` here is a third credential, distinct from the Access
+service token and from the tunnel's credentials JSON. Create it under **My
+Profile > API Tokens > Create Custom Token** with the account permission
+**Access: Apps and Policies > Edit** — that is the permission these endpoints
+check, and *Edit* rather than *Read* because the calls below write. A token
+without it returns `403` and `{"code":10000,"message":"Authentication
+error"}`, which names neither the permission nor the fact that the token is
+the problem. `ACCOUNT_ID` is in any zone's Overview sidebar, or in the
+dashboard URL.
+
 ```bash
 curl "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/access/ai-controls/mcp/servers" \
   --request POST \
