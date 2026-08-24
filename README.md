@@ -388,13 +388,55 @@ your own identity — this is the policy that replaces v1's single-user GitHub
 allowlist, and it is the only thing standing between the internet and your
 boxes, so scope it to you specifically.
 
-For each server in the portal, leave **Require user auth** off. It only
-applies to servers using per-user upstream OAuth; these use a service token.
+**Turn `Require user auth` OFF for every server in the portal.** It is
+**on by default**, and on is wrong here: it tells the portal to run a
+second, per-user OAuth flow against the box. These boxes have no OAuth — the
+service token is the whole authentication story — so that flow dead-ends. Off
+means the portal uses the stored credential, which is what the headers from
+step 4 are.
+
+The symptom if you miss it is specific and does not look like this setting:
+you authenticate to the portal successfully, and then land on
+`https://<portal-hostname>/servers-callback?oauth_session_nonce=...` showing
+**not found**. That path is the portal's *upstream* OAuth callback — proof it
+was trying to OAuth against a box rather than finishing your login.
 
 Creating the portal in the dashboard also creates the CNAME to
 `gateway.agents.cloudflare.com`. If you use the API or Terraform instead,
 create that record yourself and make sure it is proxied — a missing record
 is the usual cause of a `522`.
+
+### 5b. Turn on Managed OAuth for the portal
+
+Without this an MCP client cannot register itself and Claude reports
+`Couldn't register with <portal>'s sign-in service`. Access replies to a
+non-browser client with a browser redirect instead of the `401` and
+`WWW-Authenticate` discovery metadata a client needs.
+
+**AI controls > Portals >** the portal **> ⋯ > Edit > Advanced settings**:
+
+1. Turn on **Managed OAuth**.
+2. Under **Allowed redirect URIs**, add your client's callback. Dynamic client
+   registration is refused when this list is empty, which is the same
+   registration error as above. For Claude.ai in a browser, and for the
+   desktop and mobile apps, that is:
+
+   ```
+   https://claude.ai/api/mcp/auth_callback
+   ```
+
+   If a client still fails to register, read the callback out of the error or
+   the address bar rather than guessing — the client chooses its own redirect
+   URI and this list only permits it.
+3. Turn on **Allow loopback clients** if you also connect Claude Code from a
+   terminal. It redirects to `127.0.0.1` on a port chosen per run, so no fixed
+   URI can cover it. Leave off if you only use the web and desktop apps.
+4. Set **Grant session duration** to 1–2 weeks and leave **Access token
+   lifetime** at the 15-minute default. This is Cloudflare's recommendation
+   for agent clients: the client refreshes silently, your Access policies are
+   re-evaluated on every refresh, and you only see a browser prompt when the
+   grant expires. The default grant is tied to the session duration and will
+   have you re-authorizing far more often.
 
 ### 6. Connect Claude
 
@@ -526,6 +568,20 @@ box. Check in order: the tunnel is running (`cloudflared` in `systemctl` or
 `pm2 list`), the service is running (`systemctl status mcp-server`), the DNS
 record is proxied, and the registered URL ends in `/mcp`. Hovering the status
 in the dashboard shows the HTTP status Cloudflare actually got.
+
+**Claude says `Couldn't register with <portal>'s sign-in service`.** The
+portal's Access application is not offering OAuth registration. Turn on
+**Managed OAuth** and add the client's callback under **Allowed redirect
+URIs** — an empty list refuses every registration. See
+[step 5b](#5b-turn-on-managed-oauth-for-the-portal).
+
+**You authenticate to the portal, then get `not found` at
+`https://<portal-hostname>/servers-callback`.** The login itself worked. That
+path is the portal's *upstream* OAuth callback, so reaching it means the
+portal tried to run a per-user OAuth flow against one of your boxes — which
+have no OAuth. Turn **Require user auth** off for every server in the portal
+(**Portals > Edit > Servers**); it is on by default. See
+[step 5](#5-create-the-portal).
 
 **Server status is `Error` with HTTP 503, and `cloudflared tunnel run` works
 by hand but the service does not.** The two read different files. `cloudflared
