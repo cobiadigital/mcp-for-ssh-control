@@ -137,10 +137,12 @@ chmod 600 .env
 $EDITOR .env    # SERVER_ID and the allowlists now; ACCESS_* in step 3
 ```
 
-Pick `SERVER_ID` carefully — the portal namespaces every tool as
-`{server_id}_{tool_name}`, so `lightsail` gives you `lightsail_docker_ps`.
-Keep it short, and **do not use underscores**: the portal splits namespaced
-names on the first underscore.
+`SERVER_ID` is a label for this box. It shows up in the service's log lines,
+in `server_info` output, and as the MCP server's advertised name — it is how
+you tell one box's output from another's when reading logs. It does not
+affect how Claude addresses the tools; that is set on the Cloudflare side in
+[step 4](#4-register-each-box-as-an-mcp-server-in-access), and it is conventional to
+use the same word in both places.
 
 Prerequisite check: run `docker ps` as the service user. If it is denied you
 are not in the `docker` group and the `docker_*` tools will not work until an
@@ -254,8 +256,9 @@ Notes that matter:
 
 - The URL **must** end in `/mcp`. The portal treats that as "Streamable HTTP
   only" and skips its SSE fallback probing.
-- `server_id` is what namespaces the tools. Keep it identical to the box's
-  `SERVER_ID`, and keep it free of underscores.
+- **`server_id` must not contain underscores** — use hyphens
+  (`aws-docker`, not `aws_docker`). See [How tool names are
+  built](#how-tool-names-are-built) below for why.
 - The same values are editable in the dashboard afterwards under **AI
   controls > MCP servers >** the server **> Authentication**.
 
@@ -265,6 +268,36 @@ invisible in every portal.
 
 Repeat for each box. The server status should reach **Ready**, meaning
 Cloudflare connected and read the tool list.
+
+#### How tool names are built
+
+The portal merges the tools from every box into one flat list. All three
+boxes expose a tool called `docker_ps`, so the portal prefixes each one with
+that box's `server_id` to keep them apart:
+
+```
+box "lightsail"   →  lightsail_docker_ps
+box "aws-docker"  →  aws-docker_docker_ps
+```
+
+When Claude calls `lightsail_docker_ps`, the portal reverses that to decide
+where to forward the call. It splits **on the first underscore only** —
+everything before it is the server id, everything after it is the tool name:
+
+```
+lightsail_docker_ps   →  server "lightsail"  +  tool "docker_ps"     ✓
+```
+
+Tool names can therefore contain underscores freely, since only the first one
+is a delimiter. A `server_id` cannot, because its underscore would be read as
+the delimiter instead:
+
+```
+aws_docker_docker_ps  →  server "aws"  +  tool "docker_docker_ps"    ✗
+```
+
+Neither of those exists, so every tool on that box fails. Keep server ids
+short and hyphenated.
 
 ### 5. Create the portal
 
