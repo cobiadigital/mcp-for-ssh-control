@@ -74,7 +74,29 @@ app.get("/healthz", (_req, res) => {
   });
 });
 
-app.all("/mcp", async (req, res) => {
+/**
+ * The MCP endpoint is POST-only.
+ *
+ * Streamable HTTP also defines GET, for a standalone SSE stream the server
+ * can push notifications down. A stateless server has nothing to push — every
+ * call is one request and one reply — and leaving GET wired to the transport
+ * opens a keep-alive stream that never terminates, so a probe or a health
+ * check on this URL hangs instead of failing fast. The spec's answer for a
+ * server that does not offer that stream is 405, so say so.
+ */
+app.all("/mcp", (req, res, next) => {
+  if (req.method === "POST") return next();
+  res.status(405).set("Allow", "POST").json({
+    jsonrpc: "2.0",
+    error: {
+      code: -32000,
+      message: `Method Not Allowed: this MCP endpoint accepts POST only, not ${req.method}.`,
+    },
+    id: null,
+  });
+});
+
+app.post("/mcp", async (req, res) => {
   const server = createServer();
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined, // stateless: no session ids to track
