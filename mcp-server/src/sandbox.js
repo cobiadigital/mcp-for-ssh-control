@@ -18,6 +18,7 @@ import path from "node:path";
 import fsp from "node:fs/promises";
 import { execFile } from "node:child_process";
 import {
+  ALLOWED_COMPOSE_PATHS,
   ALLOWED_CONTAINERS,
   ALLOWED_PATHS,
   ALLOWED_SERVICES,
@@ -84,10 +85,11 @@ export const requireAllowlistedService = (service) =>
  * directory is resolved instead and must already exist — this keeps the check
  * honest without letting a write create directories outside the roots.
  */
-export async function resolveAllowedPath(rawPath) {
-  if (ALLOWED_PATHS.length === 0) {
+export async function resolveAllowedPath(rawPath, roots = ALLOWED_PATHS, disabledHint = null) {
+  if (roots.length === 0) {
     throw new ToolError(
-      "File and script tools are disabled on this server — set ALLOWED_PATHS (comma-separated directory roots) in the service env and restart."
+      disabledHint ??
+        "File and script tools are disabled on this server — set ALLOWED_PATHS (comma-separated directory roots) in the service env and restart."
     );
   }
   const p = String(rawPath ?? "");
@@ -108,7 +110,7 @@ export async function resolveAllowedPath(rawPath) {
     real = path.join(realParent, path.basename(p));
   }
 
-  for (const root of ALLOWED_PATHS) {
+  for (const root of roots) {
     let realRoot;
     try {
       realRoot = await fsp.realpath(root);
@@ -119,7 +121,7 @@ export async function resolveAllowedPath(rawPath) {
   }
 
   throw new ToolError(
-    `Path "${p}" is outside this server's allowed roots: ${ALLOWED_PATHS.join(", ")}`
+    `Path "${p}" is outside this server's allowed roots: ${roots.join(", ")}`
   );
 }
 
@@ -251,4 +253,74 @@ export async function execToText(argv, timeoutMs = EXEC_TIMEOUT_MS) {
     return `Command failed with exit code ${r.code} (no output)`;
   }
   return out || "(no output)";
+}
+
+// ---------------------------------------------------------------------------
+// Docker Compose
+// ---------------------------------------------------------------------------
+
+const COMPOSE_FILE_RE = /\.ya?ml$/i;
+
+/**
+ * Resolve a compose file against ALLOWED_COMPOSE_PATHS — its own root list,
+ * not the file tools' roots. Bringing a stack up is a heavier grant than
+ * editing a script, because a compose file may request bind mounts and
+ * privileged containers, so it takes a separate deliberate opt-in.
+ */
+export async function resolveComposeFile(rawPath) {
+  const file = await resolveAllowedPath(
+    rawPath,
+    ALLOWED_COMPOSE_PATHS,
+    "Compose tools are disabled on this server — set ALLOWED_COMPOSE_PATHS (comma-separated directory roots) in the service env and restart."
+  );
+  if (!COMPOSE_FILE_RE.test(file)) {
+    throw new ToolError(`Not a compose file (expected .yml or .yaml): ${rawPath}`);
+  }
+  let st;
+  try {
+    st = await fsp.stat(file);
+  } catch {
+    throw new ToolError(`Compose file not found: ${rawPath}`);
+  }
+  if (!st.isFile()) throw new ToolError(`Not a regular file: ${rawPath}`);
+  return file;
+}
+
+/**
+ * Compose ships two ways: as the `docker compose` CLI plugin (current) and as
+ * the standalone `docker-compose` binary (older boxes). Probe once and cache,
+ * so a box with only one of them still works without configuration.
+ */
+let composeBaseArgv = null;
+export async function composeCommand() {
+  if (composeBaseArgv) return composeBaseArgv;
+  const plugin = await exec(["docker", "compose", "version"], 10_000);
+  if (plugin.code === 0) {
+    composeBaseArgv = ["docker", "compose"];
+    return composeBaseArgv;
+  }
+  const standalone = await exec(["docker-compose", "version"], 10_000);
+  if (standalone.code === 0) {
+    composeBaseArgv = ["docker-compose"];
+    return composeBaseArgv;
+  }
+  throw new ToolError(
+    "Neither `docker compose` nor `docker-compose` is available on this server."
+  );
+}
+
+/**
+ * Compose service names named by a caller. Shape-checked only: they are
+ * already scoped to one jailed compose file, and the check is what keeps a
+ * name from being read as a command-line option.
+ */
+export function validateComposeServices(raw) {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new ToolError("services must be an array of strings");
+  if (raw.length > 32) throw new ToolError("Too many services (max 32)");
+  return raw.map((value) => {
+    const name = String(value);
+    if (!NAME_RE.test(name)) throw new ToolError(`Invalid compose service name: "${name}"`);
+    return name;
+  });
 }

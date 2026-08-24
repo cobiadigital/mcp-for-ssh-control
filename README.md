@@ -93,6 +93,13 @@ MCP server on the box (127.0.0.1:8787/mcp)
   The honest caveat: write access plus run access inside the same root is
   code execution as the service user. Only list directories you are
   comfortable with a model editing and executing in.
+- **Container creation goes through a file, not a flag.** The
+  `docker_compose_*` tools take a path to a compose file and nothing else —
+  no image, port, mount, or capability is ever read from a tool argument.
+  They are jailed to `ALLOWED_COMPOSE_PATHS`, a list kept separate from
+  `ALLOWED_PATHS` precisely so that enabling them is a deliberate act. Read
+  [Creating containers](#creating-containers) before setting it: a compose
+  file is a more powerful thing to control than a shell script.
 - **One Access policy controls access.** Where v1 hardcoded a single GitHub
   username, v2 uses an Access policy — your email, your IdP group, plus
   device posture or country rules if you want them.
@@ -336,6 +343,10 @@ argument in v2.
 | `docker_ps` | All containers with status and ports. |
 | `docker_logs` | Allowlisted container; `lines` defaults to 50, max 1000. |
 | `docker_restart` | Allowlisted container. |
+| `docker_compose_up` | Creates and starts a stack from a compose file (`up -d`). Optional `services`, `recreate`. |
+| `docker_compose_down` | Stops and removes a stack's containers. Never passes `--volumes`, so data survives. |
+| `docker_compose_pull` | Pulls a stack's images without starting anything. |
+| `docker_compose_ps` | The stack's containers and their state. |
 | `disk_usage` / `memory_usage` / `uptime` | `df -h`, `free -h`, `uptime`. |
 | `service_status` | Allowlisted systemd unit. |
 | `list_directory` | Type, size, mtime, name. Caps at 500 entries. |
@@ -345,7 +356,63 @@ argument in v2.
 | `check_script` | `bash -n` / `sh -n` (plus shellcheck when installed), `py_compile`, `node --check`. Never runs the script. |
 | `run_script` | bash/sh/python3/node only, ≤16 args, timeout 1–120s (default 30). |
 
-The last six require `ALLOWED_PATHS` and refuse anything outside those roots.
+The six file and script tools require `ALLOWED_PATHS` and refuse anything
+outside those roots. The four `docker_compose_*` tools require
+`ALLOWED_COMPOSE_PATHS`, which is a separate list — see [Creating
+containers](#creating-containers).
+
+## Creating containers
+
+New containers are created from a compose file on disk, not from a
+`docker run` tool. The workflow is:
+
+1. Claude writes or edits a `docker-compose.yml` with `write_file` /
+   `edit_file` — a change you can read, diff, and keep in git.
+2. `docker_compose_up` brings it up.
+
+Set the roots that permits, in the service's `.env`:
+
+```bash
+ALLOWED_COMPOSE_PATHS=/home/ubuntu/stacks
+```
+
+Leave it unset and all four compose tools are disabled and say so when
+called.
+
+### Why this is a separate setting from ALLOWED_PATHS
+
+Because a compose file is not just another file. It can ask for
+`privileged: true`, or bind-mount `/` into a container, or add
+`CAP_SYS_ADMIN` — and the Docker daemon runs as root. So anything that can
+both **write** a compose file and **bring it up** can become root on the box,
+even though nothing in this codebase ever runs a shell.
+
+That is a real escalation over the script tools, where the blast radius stops
+at the service user. Keeping the two root lists separate means you can grant
+the safer one widely and the sharper one narrowly:
+
+```bash
+# Claude may edit anything under here, but cannot deploy from it
+ALLOWED_PATHS=/home/ubuntu/scripts,/home/ubuntu/sites,/home/ubuntu/stacks
+# ...and may only bring stacks up from here
+ALLOWED_COMPOSE_PATHS=/home/ubuntu/stacks
+```
+
+The strictest arrangement is to leave the compose roots *out* of
+`ALLOWED_PATHS` entirely. Then Claude can deploy the compose files you wrote
+but cannot rewrite them first, and the escalation above is closed. Pick that
+one if you want the tools to operate stacks rather than author them.
+
+### What the tools deliberately cannot do
+
+- **No `--volumes` on down.** `docker_compose_down` removes containers and
+  leaves named volumes alone, so a tool call cannot destroy a database.
+  Removing volumes stays an SSH job.
+- **No image or flag from a tool argument.** Everything comes from the file.
+  The only other argument is an optional list of service names, shape-checked
+  so it cannot be read as an option.
+- **No compose file outside the roots**, and the path must end in `.yml` or
+  `.yaml`.
 
 ## Adding a server later
 
