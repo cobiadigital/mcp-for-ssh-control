@@ -209,6 +209,26 @@ cloudflared tunnel route dns lightsail-mcp lightsail-mcp.<yourdomain>.com
 sudo cloudflared service install        # or: pm2 start "cloudflared tunnel run lightsail-mcp" --name cloudflared
 ```
 
+Know what `service install` does with that config: it **copies** it to
+`/etc/cloudflared/config.yml` and the service reads the copy from then on.
+Editing `~/.cloudflared/config.yml` afterwards changes nothing, and running
+`cloudflared tunnel run` by hand — which reads the home-directory file —
+can succeed while the service keeps failing against a stale copy. On a
+rebuilt box the `/etc` copy may still name a tunnel that no longer exists.
+
+So after installing, confirm the service is using the config you think it is:
+
+```bash
+systemctl cat cloudflared | grep -- --config    # which file the unit reads
+sudo cat /etc/cloudflared/config.yml            # what is actually in it
+cloudflared tunnel list                         # does that tunnel still exist?
+```
+
+Treat `/etc/cloudflared/config.yml` as authoritative and edit it directly.
+Keep the credentials JSON beside it (`sudo cp ~/.cloudflared/<TUNNEL_ID>.json
+/etc/cloudflared/ && sudo chmod 600 /etc/cloudflared/<TUNNEL_ID>.json`) so the
+service does not depend on a home directory it may not be able to read.
+
 No firewall changes — the tunnel is an outbound connection. Confirm the DNS
 record Cloudflare created for the hostname has **Proxy status: Proxied**.
 
@@ -454,6 +474,32 @@ box. Check in order: the tunnel is running (`cloudflared` in `systemctl` or
 `pm2 list`), the service is running (`systemctl status mcp-server`), the DNS
 record is proxied, and the registered URL ends in `/mcp`. Hovering the status
 in the dashboard shows the HTTP status Cloudflare actually got.
+
+**Server status is `Error` with HTTP 503, and `cloudflared tunnel run` works
+by hand but the service does not.** The two read different files. `cloudflared
+service install` copies your config to `/etc/cloudflared/config.yml` and the
+unit runs with `--config /etc/cloudflared/config.yml`, while a bare
+`cloudflared tunnel run` reads `~/.cloudflared/config.yml`. If the `/etc` copy
+names a tunnel that was since deleted or recreated — common after rebuilding a
+box — the service authenticates against a tunnel that no longer matches.
+
+The signature in `journalctl -u cloudflared` is distinctive: the prechecks all
+pass (`QUIC connection successful`, `API is reachable`) and then
+`control stream encountered a failure while serving`, retrying forever, with
+the unit stuck in `activating (start)` rather than `active (running)`. Passing
+prechecks rule out network, DNS and firewall — connectivity is fine and the
+edge is refusing the registration.
+
+Fix it by making `/etc/cloudflared/config.yml` correct (see
+[step 2](#2-cloudflare-tunnel)), stopping any hand-run `cloudflared`, and
+restarting the service. Then confirm the hostname's DNS points at the tunnel
+that is actually running — a CNAME still aimed at a dead tunnel's
+`<uuid>.cfargotunnel.com` returns the same 503 even after the service
+connects:
+
+```bash
+cloudflared tunnel route dns <working-tunnel> <hostname>
+```
 
 **Server status is `Error` with HTTP 403 and an HTML body titled
 `Error ・ Cloudflare Access`.** The request never reached the box — Access
