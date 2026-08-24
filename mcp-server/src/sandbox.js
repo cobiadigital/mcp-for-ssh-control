@@ -39,33 +39,42 @@ export class ToolError extends Error {}
  */
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.@-]*$/;
 
-export function requireAllowlistedContainer(container) {
-  const name = String(container ?? "");
+/**
+ * A lone `*` opens the allowlist to every name of the right shape. The shape
+ * check still runs — that is what stops a name from being read as a
+ * command-line option — so `*` widens *which* containers the tools may name,
+ * never what may be done to them.
+ */
+export const isWildcard = (allowlist) =>
+  allowlist.length === 1 && allowlist[0] === "*";
+
+/** How an allowlist reads in tool output and startup logs. */
+export function describeAllowlist(allowlist, noun) {
+  if (isWildcard(allowlist)) return `* (every ${noun} on this box)`;
+  return allowlist.join(", ") || `(none allowlisted)`;
+}
+
+function requireAllowlisted(value, allowlist, noun, envVar) {
+  const name = String(value ?? "");
   if (!NAME_RE.test(name)) {
-    throw new ToolError(`Invalid container name: "${name}"`);
+    throw new ToolError(`Invalid ${noun} name: "${name}"`);
   }
-  if (!ALLOWED_CONTAINERS.includes(name)) {
+  if (isWildcard(allowlist)) return name;
+  if (!allowlist.includes(name)) {
     throw new ToolError(
-      `Container "${name}" is not on this server's allowlist. Allowed: ${
-        ALLOWED_CONTAINERS.join(", ") || "(none configured — set ALLOWED_CONTAINERS)"
+      `${noun[0].toUpperCase()}${noun.slice(1)} "${name}" is not on this server's allowlist. Allowed: ${
+        allowlist.join(", ") || `(none configured — set ${envVar})`
       }`
     );
   }
   return name;
 }
 
-export function requireAllowlistedService(service) {
-  const name = String(service ?? "");
-  if (!NAME_RE.test(name)) {
-    throw new ToolError(`Invalid service name: "${name}"`);
-  }
-  if (!ALLOWED_SERVICES.includes(name)) {
-    throw new ToolError(
-      `Service "${name}" is not on this server's allowlist. Allowed: ${ALLOWED_SERVICES.join(", ")}`
-    );
-  }
-  return name;
-}
+export const requireAllowlistedContainer = (container) =>
+  requireAllowlisted(container, ALLOWED_CONTAINERS, "container", "ALLOWED_CONTAINERS");
+
+export const requireAllowlistedService = (service) =>
+  requireAllowlisted(service, ALLOWED_SERVICES, "service", "ALLOWED_SERVICES");
 
 /**
  * Resolve a caller-supplied path and enforce that it lives inside one of the

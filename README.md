@@ -81,7 +81,9 @@ MCP server on the box (127.0.0.1:8787/mcp)
 - **Names are allowlisted.** Container and unit names must match a strict
   shape *and* appear in `ALLOWED_CONTAINERS` / `ALLOWED_SERVICES`. The shape
   check is a second line of defense: even an allowlist typo cannot smuggle an
-  option-like argument such as `--privileged`.
+  option-like argument such as `--privileged`. Either list may be set to a
+  lone `*` to accept every name on the box; the shape check still applies,
+  and the set of *operations* is unchanged either way.
 - **File and script tools are jailed to `ALLOWED_PATHS`.** Every path is
   resolved with `realpath`, so `..` segments and symlinks planted inside a
   root cannot escape it. Unset `ALLOWED_PATHS` and all six tools are disabled.

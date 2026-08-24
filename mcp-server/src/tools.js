@@ -26,6 +26,7 @@ import {
   ToolError,
   asToolError,
   combinedOutput,
+  describeAllowlist,
   exec,
   execToText,
   requireAllowlistedContainer,
@@ -94,8 +95,8 @@ export function registerTools(server) {
         `hostname:         ${os.hostname()}`,
         `platform:         ${os.type()} ${os.release()}`,
         `uptime:           ${Math.floor(os.uptime() / 3600)}h`,
-        `containers:       ${ALLOWED_CONTAINERS.join(", ") || "(none allowlisted)"}`,
-        `services:         ${ALLOWED_SERVICES.join(", ")}`,
+        `containers:       ${describeAllowlist(ALLOWED_CONTAINERS, "container")}`,
+        `services:         ${describeAllowlist(ALLOWED_SERVICES, "service")}`,
         `file/script roots: ${
           ALLOWED_PATHS.join(", ") || "(none — file and script tools are disabled)"
         }`,
