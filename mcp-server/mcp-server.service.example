@@ -1,0 +1,41 @@
+# systemd unit for the on-box MCP server.
+#
+# Install:
+#   sudo cp mcp-server.service.example /etc/systemd/system/mcp-server.service
+#   # edit User/WorkingDirectory/EnvironmentFile below to match your box
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mcp-server
+#
+# Then add "mcp-server" to ALLOWED_SERVICES so you can check its own status
+# through the portal.
+
+[Unit]
+Description=MCP server for remote box control (loopback only, via Cloudflare Tunnel)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/mcp-for-ssh-control/mcp-server
+EnvironmentFile=/home/ubuntu/mcp-for-ssh-control/mcp-server/.env
+ExecStart=/usr/bin/node src/index.js
+Restart=on-failure
+RestartSec=5
+
+# The service needs docker and systemctl, so it cannot be fully sandboxed —
+# but it never needs to write outside ALLOWED_PATHS or gain new privileges.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mcp-server
+
+[Install]
+WantedBy=multi-user.target

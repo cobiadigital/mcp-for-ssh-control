@@ -1,165 +1,175 @@
-# Server Control via Remote MCP
+# Server Control via MCP Portal
 
 Manage one or more servers — Docker containers, disk/memory checks, service
 status, file editing, and script diagnosis — from Claude (mobile app,
-claude.ai, or Claude Code) as a custom MCP connector, **with no inbound ports
-opened on the servers**.
+claude.ai, or Claude Code), **with no inbound ports opened on the servers**.
 
-A single Worker can front a whole fleet: each machine gets a short alias, and
-every tool takes an optional `server` argument choosing which one to act on.
-See [Multiple servers](#multiple-servers). With one server configured the
-argument can be omitted entirely, so a single-box setup looks exactly like it
-always did.
+Each box runs a small MCP server bound to loopback and reachable only through
+a Cloudflare Tunnel. A [Cloudflare MCP server portal][portal-docs] aggregates
+them behind one URL and one login, and that URL is what you add to Claude.
+
+[portal-docs]: https://developers.cloudflare.com/cloudflare-one/access-controls/ai-controls/mcp-portals/
+
+---
+
+## v2 is a clean break
+
+v1 put a Cloudflare Worker in the middle: it implemented the MCP protocol,
+ran its own GitHub OAuth flow against a single-user allowlist, and forwarded
+each call to a private `POST /run` JSON API on the box. Cloudflare's MCP
+portals now do the aggregation and the authentication, so the Worker is gone
+and the box speaks MCP directly.
+
+**v2 is not compatible with a v1 install and does not try to be.** The
+Worker, its OAuth app, its KV namespace, and the `/run` endpoint no longer
+exist. Install from scratch, then [tear down the v1 pieces](#retiring-a-v1-install).
+
+| | v1 | v2 |
+|---|---|---|
+| MCP implementation | Cloudflare Worker | on the box |
+| Authentication | GitHub OAuth app + single-user allowlist, implemented in the Worker | Cloudflare Access policy on the portal |
+| Multiple servers | one Worker fanning out, `server` argument on every tool | portal aggregates, tools namespaced `{server_id}_{tool}` |
+| Box API | private `POST /run {command, args}` | MCP Streamable HTTP at `POST /mcp` |
+| Code to maintain | ~1,150 lines of Worker + ~580 on the box | ~950 on the box |
+| Deploy pipeline | Workers Builds on every push | `git pull` + restart |
 
 ## Architecture
 
 ```
 Claude (any client)
-   → HTTPS → Cloudflare Worker (mcp-ssh.<yourdomain>.com)
-        - Auth: GitHub OAuth, restricted to ONE allowlisted GitHub username
-        - Implements the MCP tools (list_servers, docker_ps, docker_logs,
-          docker_restart, disk_usage, memory_usage, service_status, uptime,
-          plus file and script tools: list_directory, read_file, write_file,
-          edit_file, check_script, run_script)
-        - Picks a target server from the call's `server` argument and the
-          SERVERS configuration, then forwards the call over HTTPS,
-          authenticated with a Cloudflare Access service token
-   → Cloudflare Tunnel (outbound-only from each box)
-   → Internal service on each box (127.0.0.1:8787)
-        - Re-validates the Access service token on every request
-        - Executes ONLY whitelisted commands (never arbitrary shell)
-        - Container/service names checked against explicit allowlists
+   │
+   │  HTTPS + OAuth via Cloudflare Access
+   ▼
+Cloudflare MCP server portal (mcp.<yourdomain>.com)
+   - One Access policy decides who may connect at all
+   - Aggregates every box, namespacing tools as {server_id}_{tool_name}
+   - Logs every tool call: who, what, when
+   │
+   │  attaches each box's Access service token as request headers
+   ▼
+Cloudflare Access (validates the service token at the edge)
+   │
+   ▼
+Cloudflare Tunnel (outbound-only from each box — no inbound ports)
+   │
+   ▼
+MCP server on the box (127.0.0.1:8787/mcp)
+   - Re-validates the service token itself
+   - Executes ONLY the tools defined in src/tools.js, never arbitrary shell
+   - Container/service names checked against explicit allowlists
+   - File and script tools jailed to ALLOWED_PATHS
 
                       ┌→ tunnel → box "lightsail"   (its own allowlists)
-   one Worker ────────┤
-                      └→ tunnel → box "aws-docker"  (its own allowlists)
+   one portal ────────┼→ tunnel → box "aws-docker"  (its own allowlists)
+                      └→ tunnel → box "web"         (its own allowlists)
 ```
 
-Security properties this design preserves:
+## Security properties
 
-- **No new inbound ports.** `cloudflared` dials out; the Lightsail firewall
-  never changes.
-- **Loopback only.** The internal service binds `127.0.0.1` and is reachable
-  exclusively through the tunnel.
+- **No new inbound ports.** `cloudflared` dials out; the server firewall never
+  changes. The MCP server binds `127.0.0.1` and the bind address is not
+  configurable.
 - **Two auth layers on the tunnel.** Cloudflare Access validates the service
-  token at the edge, and the internal service re-checks the
-  `CF-Access-Client-Id` / `CF-Access-Client-Secret` headers itself
-  (timing-safe compare) — anything else gets a 401.
-- **No arbitrary shell, ever.** The internal service has a fixed `COMMANDS`
-  map; each command is built as an argv array and run with `execFile`
-  (no shell interpretation). Container and service names must pass a shape
-  check *and* an explicit allowlist (`ALLOWED_CONTAINERS` /
-  `ALLOWED_SERVICES` env vars).
-- **File and script tools are jailed to `ALLOWED_PATHS`.** Reading, writing,
-  editing, listing, checking, and running are only possible inside the
-  directory roots you list in `ALLOWED_PATHS` — every path is resolved with
-  `realpath`, so `..` segments and symlinks planted inside a root can't
-  escape it. If `ALLOWED_PATHS` is unset, all six tools are disabled.
-  `run_script` never invokes an arbitrary binary: it runs a script *file*
-  from inside the roots through a fixed interpreter set (bash/sh/python3/
-  node, chosen by shebang or extension). Note the honest caveat: write +
-  run inside the same root is code execution as the service user — only
-  list directories you're comfortable with Claude editing and executing in.
-- **Single-user OAuth.** The Worker's GitHub OAuth flow refuses to issue an
-  MCP token to any GitHub account except `ALLOWED_GITHUB_USER`.
-- **No secrets in the repo.** Everything sensitive goes through
-  `wrangler secret put` or an env file on the box.
+  token at the edge, and the MCP server re-checks it on the box with a
+  timing-safe comparison. Access consumes the `CF-Access-Client-*` headers,
+  so the portal is configured to send a second copy as `X-Internal-Client-*`
+  that survives the hop — a misconfigured Access application still cannot
+  expose an unauthenticated box.
+- **No arbitrary shell, ever.** Every command is built as an argv array and
+  run with `execFile` and `shell: false`. There is no string interpolation
+  into a command line anywhere in this codebase, and no tool accepts one.
+- **Names are allowlisted.** Container and unit names must match a strict
+  shape *and* appear in `ALLOWED_CONTAINERS` / `ALLOWED_SERVICES`. The shape
+  check is a second line of defense: even an allowlist typo cannot smuggle an
+  option-like argument such as `--privileged`.
+- **File and script tools are jailed to `ALLOWED_PATHS`.** Every path is
+  resolved with `realpath`, so `..` segments and symlinks planted inside a
+  root cannot escape it. Unset `ALLOWED_PATHS` and all six tools are disabled.
+  `run_script` never invokes an arbitrary binary — it runs a script *file*
+  from inside the roots through a fixed interpreter set (bash/sh/python3/node,
+  chosen by shebang or extension).
+  The honest caveat: write access plus run access inside the same root is
+  code execution as the service user. Only list directories you are
+  comfortable with a model editing and executing in.
+- **One Access policy controls access.** Where v1 hardcoded a single GitHub
+  username, v2 uses an Access policy — your email, your IdP group, plus
+  device posture or country rules if you want them.
+- **Every call is logged.** Zero Trust > Access controls > AI controls shows
+  which identity called which tool on which server, and when.
+- **No secrets in the repo.** Credentials live in a gitignored `.env` on each
+  box and in Cloudflare, which stores them encrypted.
 
 ## Repo layout
 
 ```
-worker/                — Cloudflare Worker (deploy via Workers Builds or wrangler)
-  src/index.ts            — OAuthProvider entrypoint + MCP agent + tool definitions
-  src/servers.ts          — parses SERVERS, resolves a tool call's target box
-  src/github-handler.ts   — GitHub OAuth flow with single-user allowlist
-  src/workers-oauth-utils.ts — client-approval dialog + signed cookie helpers
-  wrangler.toml
-aws-docker-worker/     — an identical copy of worker/, kept only for an older
-                         one-Worker-per-server deployment (see Multiple
-                         servers → Consolidating). Not needed for new setups.
-internal-service/      — runs on each box (deployed manually)
-  server.js               — Express app, whitelist-only command execution
-  smoke-test.sh           — curl-based auth/whitelist verification
-  lightsail-mcp-internal.service.example — systemd unit template
+mcp-server/                 — runs on each box; this is the whole product
+  src/index.js                — HTTP entrypoint, Streamable HTTP transport
+  src/config.js               — environment parsing and validation
+  src/auth.js                 — service-token check (timing-safe)
+  src/sandbox.js              — allowlists, path jail, argv execution
+  src/tools.js                — the 14 tool definitions
+  smoke-test.sh               — verifies auth, handshake, and that the
+                                allowlists actually reject
+  mcp-server.service.example  — systemd unit template
+  .env.example
 ```
-
-If you use Cloudflare **Workers Builds**, set **Root Directory = `worker`**
-so pushes only build/deploy that folder. The internal service is deployed by
-hand (`git pull` + restart) on the box.
 
 ---
 
-## Deployment walkthrough
+## Deployment
 
-You'll need: a Cloudflare account with your domain on it, a GitHub account,
-and SSH access to the Lightsail box (for setup only — after this you won't
-need it for day-to-day checks).
+You need a Cloudflare account with your domain on it, an
+[identity provider configured in Zero Trust][idp], and SSH access to each box
+for setup only.
 
-### 1. Internal service on the Lightsail box
+[idp]: https://developers.cloudflare.com/cloudflare-one/integrations/identity-providers/
+
+Steps 1–3 are per box. Steps 4–6 are once.
+
+### 1. Install the MCP server on the box
 
 ```bash
-# on the box
 git clone https://github.com/cobiadigital/mcp-for-ssh-control.git
-cd mcp-for-ssh-control/internal-service
+cd mcp-for-ssh-control/mcp-server
 npm install
-```
-
-Create `.env` in the `internal-service/` folder (it's gitignored, so
-`git pull` never touches it). You'll fill in the two `ACCESS_*` values in
-step 3:
-
-```bash
-cd ~/mcp-for-ssh-control/internal-service
-tee .env > /dev/null <<'EOF'
-ACCESS_CLIENT_ID=REPLACE_ME.access
-ACCESS_CLIENT_SECRET=REPLACE_ME
-# The exact docker container names you allow, comma-separated
-# (get them with: docker ps --format '{{.Names}}' | paste -sd, -)
-ALLOWED_CONTAINERS=wordpress,wordpress-db,odoo,odoo-db,wanderer,crm
-ALLOWED_SERVICES=nginx,docker,cloudflared
-# Directory roots the file/script tools may touch, comma-separated absolute
-# paths. Leave unset to disable those tools entirely. Anything under these
-# roots can be read, edited, AND executed by Claude — scope accordingly.
-ALLOWED_PATHS=/home/ubuntu/scripts,/home/ubuntu/sites
-PORT=8787
-EOF
+cp .env.example .env
 chmod 600 .env
+$EDITOR .env    # SERVER_ID and the allowlists now; ACCESS_* in step 3
 ```
 
-Then run it — two options depending on whether you have root:
+Pick `SERVER_ID` carefully — the portal namespaces every tool as
+`{server_id}_{tool_name}`, so `lightsail` gives you `lightsail_docker_ps`.
+Keep it short, and **do not use underscores**: the portal splits namespaced
+names on the first underscore.
 
-**Without sudo (user-level, e.g. a shared/managed host):** use pm2 with the
-bundled `start.sh` wrapper, which loads `.env` and starts the server:
+Prerequisite check: run `docker ps` as the service user. If it is denied you
+are not in the `docker` group and the `docker_*` tools will not work until an
+admin adds you. The disk, memory, uptime, and `systemctl status` tools are
+unaffected.
+
+Run it as a service:
 
 ```bash
-npm install -g pm2   # if this needs root: npm config set prefix ~/.local
-                     # and add ~/.local/bin to PATH first
-pm2 start ./start.sh --name lightsail-mcp-internal
+sudo cp mcp-server.service.example /etc/systemd/system/mcp-server.service
+sudo $EDITOR /etc/systemd/system/mcp-server.service   # User, WorkingDirectory, EnvironmentFile
+sudo systemctl daemon-reload
+sudo systemctl enable --now mcp-server
 ```
 
-Prerequisite check: run `docker ps` as your user. If it's denied, you're not
-in the `docker` group and the `docker_*` tools can't work until a host admin
-adds you (`systemctl status` and the disk/memory/uptime tools are unaffected
-— reading service status doesn't need privileges).
-
-**With sudo:** copy `lightsail-mcp-internal.service.example` to
-`/etc/systemd/system/lightsail-mcp-internal.service`, adjust paths/user,
-then `sudo systemctl enable --now lightsail-mcp-internal`.
-
-The service refuses to start without the `ACCESS_*` vars, and only ever
-listens on `127.0.0.1`.
-
-**Verify it** with the smoke test (checks that bad credentials get 401 and
-non-allowlisted names get rejected):
+Without root, pm2 works equally well:
 
 ```bash
-ACCESS_CLIENT_ID=... ACCESS_CLIENT_SECRET=... ./smoke-test.sh
+pm2 start "node src/index.js" --name mcp-server --update-env
+pm2 save
+( crontab -l 2>/dev/null; echo "@reboot $(which pm2) resurrect" ) | crontab -
 ```
+
+The service refuses to start without `ACCESS_CLIENT_ID` and
+`ACCESS_CLIENT_SECRET`, so you will come back to this after step 3.
 
 ### 2. Cloudflare Tunnel
 
-cloudflared is a single static binary, so no package manager or root is
-needed — download it into `~/bin`:
+`cloudflared` is a single static binary — no package manager or root needed:
 
 ```bash
 mkdir -p ~/bin
@@ -172,334 +182,191 @@ cloudflared tunnel login
 cloudflared tunnel create lightsail-mcp
 ```
 
-Create `~/.cloudflared/config.yml` (everything cloudflared needs lives in
-`~/.cloudflared/`, no root required):
+`~/.cloudflared/config.yml`:
 
 ```yaml
 tunnel: <TUNNEL_ID>
 credentials-file: /home/<youruser>/.cloudflared/<TUNNEL_ID>.json
 ingress:
-  - hostname: lightsail-internal.<yourdomain>.com
+  - hostname: lightsail-mcp.<yourdomain>.com
     service: http://127.0.0.1:8787
   - service: http_status:404
 ```
 
 ```bash
-cloudflared tunnel route dns lightsail-mcp lightsail-internal.<yourdomain>.com
+cloudflared tunnel route dns lightsail-mcp lightsail-mcp.<yourdomain>.com
+sudo cloudflared service install        # or: pm2 start "cloudflared tunnel run lightsail-mcp" --name cloudflared
 ```
 
-Then run the tunnel. Without sudo, keep it under pm2 alongside the internal
-service; with sudo, `sudo cloudflared service install` installs it under
-systemd instead:
+No firewall changes — the tunnel is an outbound connection. Confirm the DNS
+record Cloudflare created for the hostname has **Proxy status: Proxied**.
+
+### 3. Access service token and application
+
+In **Zero Trust > Access controls**:
+
+1. **Service credentials > Create service token.** Name it after the box.
+   Copy the Client ID and Client Secret — the secret is shown once. This is
+   the only credential that reaches the box.
+2. **Applications > Add > Self-hosted.** Domain =
+   `lightsail-mcp.<yourdomain>.com`. Add one policy with action
+   **Service Auth** (not Allow) that includes that service token.
+
+Now put the token into the box's `.env` and restart:
 
 ```bash
-pm2 start "cloudflared tunnel run lightsail-mcp" --name cloudflared
+$EDITOR ~/mcp-for-ssh-control/mcp-server/.env   # ACCESS_CLIENT_ID / ACCESS_CLIENT_SECRET
+sudo systemctl restart mcp-server               # or: pm2 restart mcp-server --update-env
+./smoke-test.sh
 ```
 
-**Surviving reboots (user-level):** `pm2 startup` normally wants root, so
-use a user crontab instead — it restores both pm2 processes on boot:
+The smoke test runs against loopback on purpose — it bypasses the tunnel, so
+a failure is unambiguously the service's fault rather than the network's. All
+12 checks should pass before you go on.
+
+### 4. Register each box as an MCP server in Access
+
+This is the step that replaces the entire Worker. The portal reaches each box
+by sending the box's service token as request headers.
+
+Cloudflare stores those headers as the server's `auth_credentials`, which the
+[API documents][auth-docs] as a JSON string whose headers are forwarded
+verbatim upstream. Send **both** header pairs: Access validates and consumes
+the `CF-Access-*` pair at the edge, and the `X-Internal-*` pair passes through
+for the box's own re-check.
+
+[auth-docs]: https://developers.cloudflare.com/cloudflare-one/access-controls/ai-controls/mcp-portals/#bearer-authentication-credentials
 
 ```bash
-pm2 save
-( crontab -l 2>/dev/null; echo "@reboot $(which pm2) resurrect" ) | crontab -
+curl "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/access/ai-controls/mcp/servers" \
+  --request POST \
+  --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+  --json '{
+    "name": "lightsail",
+    "server_id": "lightsail",
+    "hostname": "https://lightsail-mcp.<yourdomain>.com/mcp",
+    "auth_type": "bearer",
+    "auth_credentials": "{\"headers\":{\"CF-Access-Client-Id\":\"<token-id>.access\",\"CF-Access-Client-Secret\":\"<token-secret>\",\"X-Internal-Client-Id\":\"<token-id>.access\",\"X-Internal-Client-Secret\":\"<token-secret>\"}}"
+  }'
 ```
 
-No firewall changes either way — the tunnel is an outbound connection.
+Notes that matter:
 
-### 3. Cloudflare Access (service token + policy)
+- The URL **must** end in `/mcp`. The portal treats that as "Streamable HTTP
+  only" and skips its SSE fallback probing.
+- `server_id` is what namespaces the tools. Keep it identical to the box's
+  `SERVER_ID`, and keep it free of underscores.
+- The same values are editable in the dashboard afterwards under **AI
+  controls > MCP servers >** the server **> Authentication**.
 
-In the Cloudflare dashboard, **Zero Trust → Access**:
+Then attach an Access policy to the server (**AI controls > MCP servers >
+Edit > Policies**) allowing your own identity. A server with no policy is
+invisible in every portal.
 
-1. **Service token**: Access → Service Auth → Create Service Token. Name it
-   e.g. `lightsail-mcp`. Copy the Client ID and Client Secret — this is the
-   only time the secret is shown. These are the `ACCESS_CLIENT_ID` /
-   `ACCESS_CLIENT_SECRET` values for **both** the internal service env file
-   (step 1) and the Worker secrets (step 5).
-2. **Application**: Access → Applications → Add → Self-hosted. Domain =
-   `lightsail-internal.<yourdomain>.com`. Add a policy with action
-   **Service Auth** (not Allow) that includes your service token.
+Repeat for each box. The server status should reach **Ready**, meaning
+Cloudflare connected and read the tool list.
 
-Now the tunnel hostname rejects anything without the token at Cloudflare's
-edge, and the internal service re-checks it again on the box. Put the real
-token values into `internal-service/.env`, restart the service
-(`pm2 restart lightsail-mcp-internal`, or `sudo systemctl restart
-lightsail-mcp-internal` on the systemd path), and re-run the smoke test
-against the public hostname to confirm the whole path:
+### 5. Create the portal
 
-```bash
-ACCESS_CLIENT_ID=... ACCESS_CLIENT_SECRET=... \
-  ./smoke-test.sh https://lightsail-internal.<yourdomain>.com
-```
+**AI controls > Portals > Create a portal.** Give it a hostname such as
+`mcp.<yourdomain>.com`, add every server, and attach an Access policy for
+your own identity — this is the policy that replaces v1's single-user GitHub
+allowlist, and it is the only thing standing between the internet and your
+boxes, so scope it to you specifically.
 
-(The two 401 checks will show 302/403 instead when Access blocks at the edge
-— either way, bad credentials don't get through.)
+For each server in the portal, leave **Require user auth** off. It only
+applies to servers using per-user upstream OAuth; these use a service token.
 
-### 4. GitHub OAuth app
-
-GitHub → Settings → Developer settings → OAuth Apps → New OAuth App:
-
-- **Homepage URL**: `https://mcp-ssh.<yourdomain>.com`
-- **Authorization callback URL**: `https://mcp-ssh.<yourdomain>.com/callback`
-
-Copy the Client ID and generate a Client Secret.
-
-### 5. Deploy the Worker (dashboard only — no wrangler CLI needed)
-
-Everything is done from the Cloudflare dashboard. Cloudflare builds the
-Worker from your repo on every push (Workers Builds), running
-`npx wrangler deploy` for you — you never run wrangler locally.
-
-#### How `wrangler.toml` fits in
-
-`worker/wrangler.toml` is committed to the repo and is the **source of truth
-for the Worker's shape**. On each deploy Cloudflare reads it and reconciles
-the live Worker to match. That split matters:
-
-| Lives in `wrangler.toml` (committed) | Lives in the dashboard (never committed) |
-|---|---|
-| Worker name, `main`, compatibility flags | Plain-text variables (`ALLOWED_GITHUB_USER`, `INTERNAL_SERVICE_URL`) |
-| Durable Object binding + migration (`MCP_OBJECT`) | Secrets (`GITHUB_*`, `ACCESS_*`, `COOKIE_ENCRYPTION_KEY`) |
-| KV binding name + **namespace id** (`OAUTH_KV`) | — |
-
-Two rules follow from this, and they are opposites — which is the part that
-trips people up:
-
-- **Bindings** (KV, Durable Objects) *must* be in `wrangler.toml`. If you add
-  a binding only through the dashboard UI, the next push-triggered deploy
-  **deletes it**, because the config file didn't mention it. This is why the
-  KV namespace id has to be written into the file (step 2 below).
-- **Variables and secrets** are the opposite. `keep_vars = true` (already set
-  in the file) tells wrangler *not* to wipe dashboard-managed variables on
-  deploy. So you set all of those in the UI once and they survive every
-  future deploy — and nothing sensitive ever lands in the repo.
-
-You will only ever edit `wrangler.toml` for one thing during setup: pasting
-the KV namespace id. Everything else in it is already correct.
-
-Then, in order:
-
-1. **Create the KV namespace**: dashboard → Storage & Databases → KV →
-   Create namespace (name it e.g. `lightsail-mcp-oauth`). Copy its
-   **Namespace ID** (a 32-char hex string).
-2. **Put the id into `wrangler.toml`** — pick one:
-   - *Commit it (simplest)*: edit `worker/wrangler.toml`, replace
-     `<REPLACE_WITH_KV_NAMESPACE_ID>` under `[[kv_namespaces]]` with the id,
-     and commit — the GitHub web editor is fine. The id is an identifier,
-     not a secret: it's useless without authenticated access to your
-     Cloudflare account, so it's safe in a public repo (Cloudflare's own
-     templates commit KV ids).
-   - *Keep it out of the repo*: leave the placeholder in the file and
-     substitute it at build time. In the Worker's build settings
-     (Settings → Build → Build command) put
-     `sed -i "s|<REPLACE_WITH_KV_NAMESPACE_ID>|$OAUTH_KV_NAMESPACE_ID|" wrangler.toml`
-     and add a **build variable** (Settings → Build) named
-     `OAUTH_KV_NAMESPACE_ID` set to the id. (`wrangler.toml` can't read env
-     vars itself; the `sed` rewrites the file just before `wrangler deploy`
-     runs. Note this is a *build* variable, distinct from the runtime
-     Variables and Secrets in step 4.)
-3. **Connect the repo**: Workers & Pages → Create → Workers → Import a
-   repository → pick this repo, and set **Root Directory = `worker`** (under
-   Advanced / Build configuration). Leave the build command empty and the
-   deploy command as the default `npx wrangler deploy`. This first build
-   creates the Worker, the KV binding, and the Durable Object migration.
-   Uncheck "Builds for non-production branches" unless you want preview
-   deploys on every branch.
-4. **Set the runtime variables and secrets**: Worker → Settings → Variables
-   and Secrets (these are what `keep_vars` preserves):
-   - Plain text: `ALLOWED_GITHUB_USER` = your GitHub username; `SERVERS` =
-     the JSON fleet map, e.g.
-     `{"lightsail":"https://lightsail-internal.<yourdomain>.com"}` — each URL
-     **must be `https://`**, not `http://` (plain http won't route through
-     the tunnel and the tool calls 404). See
-     [Multiple servers](#multiple-servers) for the full shape; make `SERVERS`
-     a *secret* instead of a plain variable if you give a server its own
-     Access credentials inside it.
-   - Secrets: `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` (step 4 above),
-     `ACCESS_CLIENT_ID`, `ACCESS_CLIENT_SECRET` (step 3, the same values as
-     the box's `.env`), and `COOKIE_ENCRYPTION_KEY` (any long random string,
-     e.g. `openssl rand -hex 32`). Paste secrets carefully — a trailing
-     space or newline makes the token silently mismatch.
-
-   Until `ALLOWED_GITHUB_USER`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`
-   and `COOKIE_ENCRYPTION_KEY` are set, the Worker refuses to serve the login
-   flow and says exactly which ones are missing. Server configuration is
-   checked separately, when a tool runs — so you can always log in and let a
-   tool call tell you what's wrong with `SERVERS`.
-
-   > Older deployments set `INTERNAL_SERVICE_URL` to a single URL instead of
-   > `SERVERS`. That still works and needs no change: the Worker falls back
-   > to it whenever `SERVERS` is unset.
-5. **Redeploy** so the new variables take effect (Deployments → retry latest,
-   or push any commit). Dashboard variable changes only apply to *new*
-   deployments.
-6. **Custom domain**: Worker → Settings → Domains & Routes → Add →
-   Custom domain → `mcp-ssh.<yourdomain>.com`. This must match the domain in
-   your GitHub OAuth app's callback URL (step 4).
-
-> **When you change `wrangler.toml` later** (e.g. a new binding), just commit
-> and push — Workers Builds redeploys automatically. **When you change a
-> variable or secret**, edit it in the dashboard and redeploy; don't put it
-> in `wrangler.toml`.
+Creating the portal in the dashboard also creates the CNAME to
+`gateway.agents.cloudflare.com`. If you use the API or Terraform instead,
+create that record yourself and make sure it is proxied — a missing record
+is the usual cause of a `522`.
 
 ### 6. Connect Claude
 
-Add a custom connector pointing at:
+Add `https://mcp.<yourdomain>.com/mcp` as a custom connector. Claude opens
+the Access login in a browser, you authenticate with your IdP, and the tools
+appear namespaced per box.
 
-```
-https://mcp-ssh.<yourdomain>.com/mcp
-```
-
-(Claude apps: Settings → Connectors → Add custom connector. Older clients
-that only speak SSE can use `/sse` instead.)
-
-On first connect you'll see the approval page, then GitHub login. Any GitHub
-account other than `ALLOWED_GITHUB_USER` gets a 403 and no token.
+---
 
 ## Tools
 
-Every tool below also takes an optional **`server`** argument: the alias of
-the machine to act on, from your `SERVERS` configuration. It is required when
-more than one server is configured and can be omitted when there is only one.
-The configured aliases appear in the argument's description, so Claude can
-pick one without asking.
+Every tool acts on the box whose namespace it carries — there is no `server`
+argument in v2.
 
-| Tool | Arguments | Runs on the box |
-|---|---|---|
-| `list_servers` | — | nothing — returns the configured aliases, URLs and descriptions |
-| `docker_ps` | — | `docker ps -a` (names/status/ports) |
-| `docker_logs` | `container`, `lines?` (1–1000) | `docker logs --tail N <name>` |
-| `docker_restart` | `container` | `docker restart <name>` |
-| `disk_usage` | — | `df -h` |
-| `memory_usage` | — | `free -h` |
-| `service_status` | `service` | `systemctl status <name> --no-pager` |
-| `uptime` | — | `uptime` |
-| `list_directory` | `path` | directory listing (type, size, mtime, name) |
-| `read_file` | `path` | read a text file (truncated past 512KB) |
-| `write_file` | `path`, `content` | create or overwrite a file (max 512KB) |
-| `edit_file` | `path`, `old_string`, `new_string`, `replace_all?` | exact string replacement (must match once unless `replace_all`) |
-| `check_script` | `path` | syntax check without running: `bash -n`/`sh -n` (+ `shellcheck` if installed), `python3 -m py_compile`, `node --check` |
-| `run_script` | `path`, `args?` (≤16), `timeout_seconds?` (1–120) | run a script via bash/sh/python3/node (from shebang or extension); returns exit code + output |
+| Tool | Notes |
+|---|---|
+| `server_info` | Hostname, allowlists, and path roots. Best first call on an unfamiliar box. |
+| `docker_ps` | All containers with status and ports. |
+| `docker_logs` | Allowlisted container; `lines` defaults to 50, max 1000. |
+| `docker_restart` | Allowlisted container. |
+| `disk_usage` / `memory_usage` / `uptime` | `df -h`, `free -h`, `uptime`. |
+| `service_status` | Allowlisted systemd unit. |
+| `list_directory` | Type, size, mtime, name. Caps at 500 entries. |
+| `read_file` | Truncates past 512 KB. |
+| `write_file` | Parent directory must already exist. |
+| `edit_file` | Exact string replacement; `old_string` must be unique unless `replace_all`. |
+| `check_script` | `bash -n` / `sh -n` (plus shellcheck when installed), `py_compile`, `node --check`. Never runs the script. |
+| `run_script` | bash/sh/python3/node only, ≤16 args, timeout 1–120s (default 30). |
 
-`container` / `service` arguments must be on the target box's allowlists, and
-every `path` must be inside one of that box's `ALLOWED_PATHS` roots (the
-file/script tools return 403 until `ALLOWED_PATHS` is configured). Allowlists
-are per box: each internal service has its own `.env`, so a container name
-valid on one server is not automatically valid on another.
+The last six require `ALLOWED_PATHS` and refuse anything outside those roots.
 
-## Multiple servers
+## Adding a server later
 
-One Worker controls a fleet. Each machine runs its own copy of
-`internal-service/` behind its own Cloudflare Tunnel and Access policy; the
-Worker just needs to know how to reach each one.
+Repeat steps 1–4 on the new box, then add it to the portal under **AI
+controls > Portals > Edit > Servers**. Nothing on the existing boxes changes,
+and nothing needs redeploying — which is the main practical win over v1,
+where fleet configuration lived in the Worker's environment.
 
-### Adding a server
+## Retiring a v1 install
 
-1. **On the new box**, do steps 1–3 of the deployment walkthrough: install the
-   internal service, create a tunnel hostname for it (e.g.
-   `aws-docker-internal.<yourdomain>.com`), and put an Access policy on that
-   hostname. The existing Access **service token can be reused** — add it to
-   the new hostname's policy — or issue a separate one for stricter blast
-   radius.
-2. **In the Worker** (Settings → Variables and Secrets), add the box to
-   `SERVERS`:
+Once the portal works, delete the v1 pieces — several of them are live
+credentials:
 
-   ```json
-   {
-     "lightsail": "https://lightsail-internal.example.com",
-     "aws-docker": {
-       "url": "https://aws-docker-internal.example.com",
-       "description": "Docker host"
-     }
-   }
-   ```
+1. Delete the `lightsail-mcp` Worker (and any per-server copy of it).
+2. Delete its KV namespace.
+3. Delete the GitHub OAuth app that fronted it.
+4. Remove the Workers Builds connection to this repo.
+5. Remove the old `mcp-ssh.<yourdomain>.com` DNS record.
+6. Remove the connector pointing at the old Worker from Claude.
+7. On each box, stop and disable the old service
+   (`lightsail-mcp-internal`), then delete the old checkout.
 
-   An entry is either a bare `https://` URL or an object with:
-
-   | Field | Required | Meaning |
-   |---|---|---|
-   | `url` | yes | the tunnel hostname of that box's internal service |
-   | `description` | no | shown to Claude next to the alias, e.g. "prod web" |
-   | `access_client_id` | no | per-server Access service token id (defaults to the Worker's `ACCESS_CLIENT_ID`) |
-   | `access_client_secret` | no | per-server Access service token secret (defaults to `ACCESS_CLIENT_SECRET`) |
-
-   Aliases are what Claude types, so keep them short: letters, digits, `-`
-   and `_`, up to 32 characters. If any entry carries its own
-   `access_client_*`, store `SERVERS` as a **secret** rather than a plain
-   text variable.
-3. **Redeploy** (Deployments → retry latest, or push any commit) — dashboard
-   variable changes only apply to new deployments. Reconnect or refresh the
-   connector in Claude so it re-reads the tool schemas; the new alias then
-   shows up in `list_servers` and in the `server` argument description.
-
-No new Worker, KV namespace, GitHub OAuth app, custom domain, or build
-configuration is involved — adding a box is one JSON entry plus its tunnel.
-
-### Consolidating an existing per-server Worker
-
-Earlier the only way to reach a second box was to deploy the same code again
-as a second Worker (that's what `aws-docker-worker/` is — a copy of `worker/`
-with a different `wrangler.toml`). With `SERVERS` that's no longer needed. To
-fold a second Worker back into the first:
-
-1. Add the second box to `SERVERS` on the **first** Worker, redeploy, and
-   confirm `list_servers` shows both and a tool call against the new alias
-   works.
-2. Remove the second Worker's connector from Claude.
-3. Delete the second Worker in the Cloudflare dashboard, along with its KV
-   namespace and its GitHub OAuth app, then delete `aws-docker-worker/` from
-   this repo.
-
-Do it in that order — deleting the folder first breaks the second Worker's
-builds while it's still serving. Until then the copy is kept byte-identical
-to `worker/src`, so both Workers behave the same.
-
-## Development
-
-```bash
-cd worker
-npm install
-npm run types       # generates worker-configuration.d.ts from wrangler.toml
-npm run typecheck
-```
-
-`worker-configuration.d.ts` is generated (gitignored) — re-run `npm run types`
-whenever `wrangler.toml` bindings change.
+Rotate the Access service tokens while you are there — v1 shared them with
+the Worker, and only the boxes and the portal need them now.
 
 ## Troubleshooting
 
-- **Tool calls return "Timed out ... waiting for the internal service on
-  ..."** — that box's tunnel or the box itself is down. Check
-  `systemctl status cloudflared` and `systemctl status lightsail-mcp-internal`
-  on it. The Worker aborts after 20s rather than hanging.
-- **`This MCP server controls N machines — pass "server" with one of: ...`**
-  — the call left `server` out while more than one is configured. Name the
-  alias (`list_servers` shows them all).
-- **`Unknown server "x"`** — the alias isn't in `SERVERS`. Note that adding
-  one requires a redeploy, and Claude may need the connector refreshed before
-  it sees the new alias.
-- **`SERVERS is not valid JSON`** — the variable has to be a single-line JSON
-  object; a stray trailing comma or a smart quote from copy-paste is the
-  usual cause. Removing `SERVERS` entirely falls back to
-  `INTERNAL_SERVICE_URL`.
-- **Tool calls return "blocked before reaching the internal service"** — the
-  credentials used for that server don't match the Access policy on its
-  tunnel hostname. Re-check step 3 and the Worker secrets; with several boxes,
-  confirm the shared service token is on *that* hostname's policy (or give the
-  server its own `access_client_id`/`access_client_secret` in `SERVERS`).
-- **"Access denied: GitHub user ... is not authorized"** — you logged into
-  GitHub with the wrong account, or `ALLOWED_GITHUB_USER` in `wrangler.toml`
-  doesn't match your username.
-- **Client stuck at "waiting for authorization"** — usually a wrong GitHub
-  callback URL. It must be exactly `https://mcp-ssh.<yourdomain>.com/callback`.
-- **`Container "x" is not on the allowlist`** — add the exact name from
-  `docker ps --format '{{.Names}}'` to `ALLOWED_CONTAINERS` in the env file
-  and restart the internal service.
-- **`File tools are disabled — set ALLOWED_PATHS`** — the file/script tools
-  ship disabled. Add `ALLOWED_PATHS=/some/dir,/other/dir` to the env file and
-  restart the internal service.
-- **`Path "..." is outside the allowed roots`** — the path (after resolving
-  symlinks) isn't under any `ALLOWED_PATHS` root. Add the root or use a path
-  inside one.
-- **`Cannot determine interpreter`** — `check_script`/`run_script` only knows
-  bash, sh, python3, and node. Give the script a shebang line (e.g.
-  `#!/usr/bin/env bash`) or a recognized extension (`.sh`, `.py`, `.js`).
+**Server status is `Error` or `unreachable`.** Cloudflare cannot reach the
+box. Check in order: the tunnel is running (`cloudflared` in `systemctl` or
+`pm2 list`), the service is running (`systemctl status mcp-server`), the DNS
+record is proxied, and the registered URL ends in `/mcp`. Hovering the status
+in the dashboard shows the HTTP status Cloudflare actually got.
+
+**Server status is `Error` with HTTP 401.** The headers in
+`auth_credentials` do not match the box's `.env`. Note that a service token's
+client id ends in `.access` — a truncated copy is the usual culprit.
+
+**`No allowed servers available, check your Zero Trust Policies`.** The
+portal has a policy but a server does not, or the server is not `Ready`.
+Every server needs its own Access policy.
+
+**The portal returns 522.** The CNAME to `gateway.agents.cloudflare.com` is
+missing or not proxied. The dashboard creates it; the API and Terraform do not.
+
+**Tools are missing after you changed them.** Cloudflare caches each server's
+tool list. Use **AI controls > MCP servers >** three dots **> Sync
+capabilities** after restarting the box's service.
+
+**A tool says something is not on the allowlist.** That is the design
+working. Add the name to `ALLOWED_CONTAINERS` / `ALLOWED_SERVICES` /
+`ALLOWED_PATHS` in the box's `.env` and restart the service.
+
+## Requirements
+
+- A domain on Cloudflare, on a full or partial (CNAME) setup
+- An identity provider configured in Cloudflare Zero Trust
+- Node.js 20+ on each box
+- MCP server portals are in open beta; portal logs export via Logpush is
+  Enterprise-only, but the in-dashboard logs are not
