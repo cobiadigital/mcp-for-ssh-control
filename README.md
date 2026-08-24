@@ -260,6 +260,15 @@ a failure is unambiguously the service's fault rather than the network's. All
 This is the step that replaces the entire Worker. The portal reaches each box
 by sending the box's service token as request headers.
 
+**Register the server through the API, not the dashboard.** The dashboard's
+*Add an MCP server* flow collects a name, a Server ID, a URL and policies, and
+then offers OAuth — it has no field for custom headers. A server added that
+way carries no credentials, so the portal reaches your hostname with no
+headers and Cloudflare Access answers with a 403 block page. The `bearer`
+authentication type below is what attaches the service token, and it is
+API-only. You can edit everything else about the server in the dashboard
+afterwards.
+
 Cloudflare stores those headers as the server's `auth_credentials`, which the
 [API documents][auth-docs] as a JSON string whose headers are forwarded
 verbatim upstream. Send **both** header pairs: Access validates and consumes
@@ -290,6 +299,26 @@ Notes that matter:
   built](#how-tool-names-are-built) below for why.
 - The same values are editable in the dashboard afterwards under **AI
   controls > MCP servers >** the server **> Authentication**.
+- To repair a server that already exists — one added through the dashboard,
+  or one whose token was rotated — `PUT` to
+  `.../ai-controls/mcp/servers/{server_id}` with the same two fields. Check
+  what a server currently has with a `GET` on `.../ai-controls/mcp/servers`
+  and look at `auth_type`: anything other than `bearer` means no headers are
+  being sent. `auth_credentials` is stored encrypted and never returned, so
+  its absence from that response tells you nothing.
+- Let a tool build the JSON. `auth_credentials` is a JSON *string* containing
+  a `headers` object, and hand-escaping the quotes is the usual way this goes
+  wrong:
+
+  ```bash
+  CRED=$(jq -nc --arg id "$TOKEN_ID" --arg sec "$TOKEN_SECRET" '{
+    headers: {
+      "CF-Access-Client-Id": $id, "CF-Access-Client-Secret": $sec,
+      "X-Internal-Client-Id": $id, "X-Internal-Client-Secret": $sec
+    }
+  }')
+  jq -nc --arg c "$CRED" '{auth_type:"bearer", auth_credentials:$c}'
+  ```
 
 Then attach an Access policy to the server (**AI controls > MCP servers >
 Edit > Policies**) allowing your own identity. A server with no policy is
@@ -506,6 +535,15 @@ cloudflared tunnel route dns <working-tunnel> <hostname>
 blocked it at the edge and served its login page, which a machine client sees
 as a 403. This server only ever answers JSON, so an HTML body is proof the
 edge answered rather than the origin.
+
+There are two ways to earn this, and they are easy to confuse. If sending the
+headers by hand (the `curl` below) also returns 403, the Access policy is
+wrong — see the fix in the next paragraph. If that `curl` returns **200** and
+only the portal gets 403, the policy is fine and the portal is not sending the
+headers at all: check the server's `auth_type` is `bearer` and re-set its
+`auth_credentials`, per [step 4](#4-register-each-box-as-an-mcp-server-in-access).
+A server added through the dashboard always lands in this second case, because
+that flow cannot set custom headers.
 
 The cause is the Access application on the *tunnel hostname*, which is a
 different object from the MCP server entry in AI controls. Open **Access >
