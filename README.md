@@ -260,14 +260,18 @@ a failure is unambiguously the service's fault rather than the network's. All
 This is the step that replaces the entire Worker. The portal reaches each box
 by sending the box's service token as request headers.
 
-**Register the server through the API, not the dashboard.** The dashboard's
-*Add an MCP server* flow collects a name, a Server ID, a URL and policies, and
-then offers OAuth — it has no field for custom headers. A server added that
-way carries no credentials, so the portal reaches your hostname with no
-headers and Cloudflare Access answers with a 403 block page. The `bearer`
-authentication type below is what attaches the service token, and it is
-API-only. You can edit everything else about the server in the dashboard
-afterwards.
+**Set the headers on the Authentication tab.** The *Add an MCP server* wizard
+does not ask for them — it collects a name, a Server ID, a URL and policies,
+then offers OAuth — so a server is registered with no credentials and the
+portal reaches your hostname bare, which Cloudflare Access answers with a 403
+block page. Adding them is a second, separate step:
+
+**AI controls > MCP servers >** the server **> ⋯ > Edit > Authentication**,
+then add the four headers below as custom headers.
+
+Doing it in the dashboard needs no API token. The same thing is settable
+through the API — see [via the API](#registering-a-server-via-the-api) — but
+that is a convenience for scripting several boxes, not a requirement.
 
 Cloudflare stores those headers as the server's `auth_credentials`, which the
 [API documents][auth-docs] as a JSON string whose headers are forwarded
@@ -277,15 +281,24 @@ for the box's own re-check.
 
 [auth-docs]: https://developers.cloudflare.com/cloudflare-one/access-controls/ai-controls/mcp-portals/#bearer-authentication-credentials
 
-`CLOUDFLARE_API_TOKEN` here is a third credential, distinct from the Access
-service token and from the tunnel's credentials JSON. Create it under **My
-Profile > API Tokens > Create Custom Token** with the account permission
-**Access: Apps and Policies > Edit** — that is the permission these endpoints
-check, and *Edit* rather than *Read* because the calls below write. A token
-without it returns `403` and `{"code":10000,"message":"Authentication
-error"}`, which names neither the permission nor the fact that the token is
-the problem. `ACCOUNT_ID` is in any zone's Overview sidebar, or in the
-dashboard URL.
+#### Registering a server via the API
+
+Useful for scripting several boxes at once. The dashboard route above does the
+same thing and needs none of this.
+
+`CLOUDFLARE_API_TOKEN` is a third credential, distinct from the Access service
+token and from the tunnel's credentials JSON. Create it under **My Profile >
+API Tokens > Create Custom Token**. Cloudflare documents these endpoints as
+checking the account permission **Access: Apps and Policies** — *Edit* rather
+than *Read*, since these calls write. `ACCOUNT_ID` is in any zone's Overview
+sidebar, or in the dashboard URL.
+
+Be ready to give up on the API quickly. A token missing the right permission
+returns `403` with `{"code":10000,"message":"Authentication error"}`, which
+names neither the permission nor even that the token is at fault, and the same
+message covers a stale token value, so it gives you nothing to iterate on. If
+a token with that permission still gets a 403, use the Authentication tab
+instead of hunting for the right scope — it is the same setting either way.
 
 ```bash
 curl "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/access/ai-controls/mcp/servers" \
@@ -309,8 +322,8 @@ Notes that matter:
   built](#how-tool-names-are-built) below for why.
 - The same values are editable in the dashboard afterwards under **AI
   controls > MCP servers >** the server **> Authentication**.
-- To repair a server that already exists — one added through the dashboard,
-  or one whose token was rotated — `PUT` to
+- To repair a server that already exists — one registered without headers, or
+  one whose token was rotated — `PUT` to
   `.../ai-controls/mcp/servers/{server_id}` with the same two fields. Check
   what a server currently has with a `GET` on `.../ai-controls/mcp/servers`
   and look at `auth_type`: anything other than `bearer` means no headers are
@@ -552,8 +565,9 @@ wrong — see the fix in the next paragraph. If that `curl` returns **200** and
 only the portal gets 403, the policy is fine and the portal is not sending the
 headers at all: check the server's `auth_type` is `bearer` and re-set its
 `auth_credentials`, per [step 4](#4-register-each-box-as-an-mcp-server-in-access).
-A server added through the dashboard always lands in this second case, because
-that flow cannot set custom headers.
+A server registered without its headers lands in this second case — the *Add
+an MCP server* wizard never asks for them, so this is the normal state of a
+newly added server until you set them on its **Edit > Authentication** tab.
 
 The cause is the Access application on the *tunnel hostname*, which is a
 different object from the MCP server entry in AI controls. Open **Access >
