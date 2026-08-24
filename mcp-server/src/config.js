@@ -40,7 +40,18 @@ export const ALLOWED_SERVICES = list(
  */
 export const ALLOWED_PATHS = list(process.env.ALLOWED_PATHS);
 
+/**
+ * Directory roots under which the docker_compose_* tools may act on a compose
+ * file. Deliberately a separate list from ALLOWED_PATHS rather than a reuse
+ * of it: a compose file can request bind mounts and privileged containers, so
+ * bringing one up is a heavier grant than editing a script. Empty (the
+ * default) disables the compose tools outright.
+ */
+export const ALLOWED_COMPOSE_PATHS = list(process.env.ALLOWED_COMPOSE_PATHS);
+
 export const EXEC_TIMEOUT_MS = 30_000;
+/** Compose pulls images and waits on healthchecks; 30s is not enough. */
+export const COMPOSE_TIMEOUT_MS = 300_000;
 export const MAX_OUTPUT_BYTES = 512 * 1024;
 export const MAX_FILE_BYTES = 512 * 1024;
 
@@ -58,9 +69,14 @@ export function configErrors() {
   if (Number.isNaN(PORT) || PORT < 1 || PORT > 65535) {
     errors.push(`PORT is not a valid port number: ${process.env.PORT}`);
   }
-  for (const root of ALLOWED_PATHS) {
-    if (!root.startsWith("/")) {
-      errors.push(`ALLOWED_PATHS entries must be absolute paths: "${root}"`);
+  for (const [name, roots] of [
+    ["ALLOWED_PATHS", ALLOWED_PATHS],
+    ["ALLOWED_COMPOSE_PATHS", ALLOWED_COMPOSE_PATHS],
+  ]) {
+    for (const root of roots) {
+      if (!root.startsWith("/")) {
+        errors.push(`${name} entries must be absolute paths: "${root}"`);
+      }
     }
   }
   return errors;

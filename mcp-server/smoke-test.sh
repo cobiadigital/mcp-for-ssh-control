@@ -68,10 +68,10 @@ fi
 
 tools=$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
 count=$(grep -o '"name":"[a-z_]*"' <<<"$tools" | wc -l)
-if [[ "$count" -ge 14 ]]; then
+if [[ "$count" -ge 18 ]]; then
   ok "tools/list advertised $count tools"
 else
-  bad "tools/list advertised $count tools, expected 14 — response: ${tools:0:300}"
+  bad "tools/list advertised $count tools, expected 18 — response: ${tools:0:300}"
 fi
 
 echo
@@ -89,17 +89,36 @@ done
 echo
 echo "4. Allowlists reject what they should"
 
-out=$(rpc '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"docker_restart","arguments":{"container":"definitely-not-allowlisted"}}}')
-grep -q 'not on this server' <<<"$out" && ok "container off the allowlist refused" || bad "container allowlist did not bite: ${out:0:200}"
+# What "correct" looks like here depends on the box's own configuration, so
+# ask it: under ALLOWED_CONTAINERS=* an arbitrary name is *supposed* to get
+# past the allowlist and reach Docker.
+info=$(rpc '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"server_info","arguments":{}}}')
+out=$(rpc '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"docker_restart","arguments":{"container":"definitely-not-allowlisted"}}}')
+if grep -q 'every container on this box' <<<"$info"; then
+  if grep -q 'not on this server' <<<"$out"; then
+    bad "ALLOWED_CONTAINERS=* but the allowlist still refused a name: ${out:0:200}"
+  else
+    ok "container wildcard in effect — any name reaches Docker (by design)"
+  fi
+else
+  grep -q 'not on this server' <<<"$out" && ok "container off the allowlist refused" || bad "container allowlist did not bite: ${out:0:200}"
+fi
 
-out=$(rpc '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"service_status","arguments":{"service":"definitely-not-allowlisted"}}}')
+out=$(rpc '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"service_status","arguments":{"service":"definitely-not-allowlisted"}}}')
 grep -q 'not on this server' <<<"$out" && ok "service off the allowlist refused" || bad "service allowlist did not bite: ${out:0:200}"
 
-out=$(rpc '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/etc/shadow"}}}')
+out=$(rpc '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/etc/shadow"}}}')
 if grep -q 'outside this server' <<<"$out" || grep -q 'are disabled' <<<"$out"; then
   ok "path outside the allowed roots refused"
 else
   bad "path jail did not bite: ${out:0:200}"
+fi
+
+out=$(rpc '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"docker_compose_up","arguments":{"path":"/etc/docker-compose.yml"}}}')
+if grep -q 'outside this server' <<<"$out" || grep -q 'are disabled' <<<"$out"; then
+  ok "compose file outside the compose roots refused"
+else
+  bad "compose jail did not bite: ${out:0:200}"
 fi
 
 echo

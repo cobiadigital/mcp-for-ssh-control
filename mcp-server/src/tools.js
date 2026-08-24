@@ -16,9 +16,12 @@ import path from "node:path";
 import os from "node:os";
 import { z } from "zod";
 import {
+  ALLOWED_COMPOSE_PATHS,
   ALLOWED_CONTAINERS,
   ALLOWED_PATHS,
   ALLOWED_SERVICES,
+  COMPOSE_TIMEOUT_MS,
+  EXEC_TIMEOUT_MS,
   MAX_FILE_BYTES,
   SERVER_ID,
 } from "./config.js";
@@ -26,13 +29,17 @@ import {
   ToolError,
   asToolError,
   combinedOutput,
+  composeCommand,
+  describeAllowlist,
   exec,
   execToText,
   requireAllowlistedContainer,
   requireAllowlistedService,
   resolveAllowedPath,
+  resolveComposeFile,
   resolveExistingFile,
   runnerFor,
+  validateComposeServices,
 } from "./sandbox.js";
 
 const text = (body) => ({ content: [{ type: "text", text: body }] });
@@ -94,10 +101,13 @@ export function registerTools(server) {
         `hostname:         ${os.hostname()}`,
         `platform:         ${os.type()} ${os.release()}`,
         `uptime:           ${Math.floor(os.uptime() / 3600)}h`,
-        `containers:       ${ALLOWED_CONTAINERS.join(", ") || "(none allowlisted)"}`,
-        `services:         ${ALLOWED_SERVICES.join(", ")}`,
+        `containers:       ${describeAllowlist(ALLOWED_CONTAINERS, "container")}`,
+        `services:         ${describeAllowlist(ALLOWED_SERVICES, "service")}`,
         `file/script roots: ${
           ALLOWED_PATHS.join(", ") || "(none — file and script tools are disabled)"
+        }`,
+        `compose roots:    ${
+          ALLOWED_COMPOSE_PATHS.join(", ") || "(none — compose tools are disabled)"
         }`,
       ];
       return text(lines.join("\n"));
@@ -162,6 +172,101 @@ export function registerTools(server) {
       const name = requireAllowlistedContainer(container);
       return text(await execToText(["docker", "restart", name]));
     }
+  );
+
+  // --- Docker Compose -----------------------------------------------------
+  // Creating containers goes through a compose file on disk rather than a
+  // free-form `docker run`. The file is jailed to ALLOWED_COMPOSE_PATHS, and
+  // no image, flag, mount or capability is ever taken from a tool argument —
+  // it all comes from a file a human can read and diff.
+
+  const composeFileArg = z
+    .string()
+    .startsWith("/", "path must be absolute")
+    .describe(
+      "Absolute path to a docker-compose .yml/.yaml file, inside one of this server's ALLOWED_COMPOSE_PATHS roots."
+    );
+
+  const composeServicesArg = z
+    .array(z.string())
+    .max(32)
+    .optional()
+    .describe("Limit the action to these compose services. Omit for all of them.");
+
+  /** Every compose tool resolves the file the same way, then runs one action. */
+  const compose = async (file, action, extra = [], timeoutMs = COMPOSE_TIMEOUT_MS) => {
+    const resolved = await resolveComposeFile(file);
+    const base = await composeCommand();
+    return text(
+      await execToText([...base, "-f", resolved, ...action, ...extra], timeoutMs)
+    );
+  };
+
+  defineTool(
+    server,
+    "docker_compose_up",
+    {
+      title: "Bring up a compose stack",
+      description:
+        "Create and start the containers defined in a docker-compose file (compose up -d). Use this to create new containers: write or edit the compose file first with write_file/edit_file, then bring it up. Images, ports, mounts and every other setting come from the file, not from this call.",
+      inputSchema: {
+        path: composeFileArg,
+        services: composeServicesArg,
+        recreate: z
+          .boolean()
+          .optional()
+          .describe("Force-recreate containers even if their config is unchanged."),
+      },
+      annotations: { destructiveHint: true },
+    },
+    async ({ path: file, services, recreate }) =>
+      compose(
+        file,
+        ["up", "-d", ...(recreate ? ["--force-recreate"] : [])],
+        validateComposeServices(services)
+      )
+  );
+
+  defineTool(
+    server,
+    "docker_compose_down",
+    {
+      title: "Take down a compose stack",
+      description:
+        "Stop and remove the containers defined in a docker-compose file (compose down). Named volumes are preserved — this never deletes data.",
+      inputSchema: { path: composeFileArg },
+      annotations: { destructiveHint: true },
+    },
+    // No --volumes, deliberately: a tool call should not be able to destroy
+    // a database. Removing volumes stays an SSH job.
+    async ({ path: file }) => compose(file, ["down"])
+  );
+
+  defineTool(
+    server,
+    "docker_compose_pull",
+    {
+      title: "Pull compose images",
+      description:
+        "Pull the images referenced by a docker-compose file without starting anything. Run before docker_compose_up to separate a slow download from the restart.",
+      inputSchema: { path: composeFileArg, services: composeServicesArg },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ path: file, services }) =>
+      compose(file, ["pull"], validateComposeServices(services))
+  );
+
+  defineTool(
+    server,
+    "docker_compose_ps",
+    {
+      title: "Compose stack status",
+      description:
+        "Show the containers belonging to a docker-compose file and their current state.",
+      inputSchema: { path: composeFileArg },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ path: file }) => compose(file, ["ps"], [], EXEC_TIMEOUT_MS)
   );
 
   // --- Host health --------------------------------------------------------

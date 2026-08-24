@@ -18,6 +18,7 @@ import path from "node:path";
 import fsp from "node:fs/promises";
 import { execFile } from "node:child_process";
 import {
+  ALLOWED_COMPOSE_PATHS,
   ALLOWED_CONTAINERS,
   ALLOWED_PATHS,
   ALLOWED_SERVICES,
@@ -39,33 +40,42 @@ export class ToolError extends Error {}
  */
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.@-]*$/;
 
-export function requireAllowlistedContainer(container) {
-  const name = String(container ?? "");
+/**
+ * A lone `*` opens the allowlist to every name of the right shape. The shape
+ * check still runs — that is what stops a name from being read as a
+ * command-line option — so `*` widens *which* containers the tools may name,
+ * never what may be done to them.
+ */
+export const isWildcard = (allowlist) =>
+  allowlist.length === 1 && allowlist[0] === "*";
+
+/** How an allowlist reads in tool output and startup logs. */
+export function describeAllowlist(allowlist, noun) {
+  if (isWildcard(allowlist)) return `* (every ${noun} on this box)`;
+  return allowlist.join(", ") || `(none allowlisted)`;
+}
+
+function requireAllowlisted(value, allowlist, noun, envVar) {
+  const name = String(value ?? "");
   if (!NAME_RE.test(name)) {
-    throw new ToolError(`Invalid container name: "${name}"`);
+    throw new ToolError(`Invalid ${noun} name: "${name}"`);
   }
-  if (!ALLOWED_CONTAINERS.includes(name)) {
+  if (isWildcard(allowlist)) return name;
+  if (!allowlist.includes(name)) {
     throw new ToolError(
-      `Container "${name}" is not on this server's allowlist. Allowed: ${
-        ALLOWED_CONTAINERS.join(", ") || "(none configured — set ALLOWED_CONTAINERS)"
+      `${noun[0].toUpperCase()}${noun.slice(1)} "${name}" is not on this server's allowlist. Allowed: ${
+        allowlist.join(", ") || `(none configured — set ${envVar})`
       }`
     );
   }
   return name;
 }
 
-export function requireAllowlistedService(service) {
-  const name = String(service ?? "");
-  if (!NAME_RE.test(name)) {
-    throw new ToolError(`Invalid service name: "${name}"`);
-  }
-  if (!ALLOWED_SERVICES.includes(name)) {
-    throw new ToolError(
-      `Service "${name}" is not on this server's allowlist. Allowed: ${ALLOWED_SERVICES.join(", ")}`
-    );
-  }
-  return name;
-}
+export const requireAllowlistedContainer = (container) =>
+  requireAllowlisted(container, ALLOWED_CONTAINERS, "container", "ALLOWED_CONTAINERS");
+
+export const requireAllowlistedService = (service) =>
+  requireAllowlisted(service, ALLOWED_SERVICES, "service", "ALLOWED_SERVICES");
 
 /**
  * Resolve a caller-supplied path and enforce that it lives inside one of the
@@ -75,10 +85,11 @@ export function requireAllowlistedService(service) {
  * directory is resolved instead and must already exist — this keeps the check
  * honest without letting a write create directories outside the roots.
  */
-export async function resolveAllowedPath(rawPath) {
-  if (ALLOWED_PATHS.length === 0) {
+export async function resolveAllowedPath(rawPath, roots = ALLOWED_PATHS, disabledHint = null) {
+  if (roots.length === 0) {
     throw new ToolError(
-      "File and script tools are disabled on this server — set ALLOWED_PATHS (comma-separated directory roots) in the service env and restart."
+      disabledHint ??
+        "File and script tools are disabled on this server — set ALLOWED_PATHS (comma-separated directory roots) in the service env and restart."
     );
   }
   const p = String(rawPath ?? "");
@@ -99,7 +110,7 @@ export async function resolveAllowedPath(rawPath) {
     real = path.join(realParent, path.basename(p));
   }
 
-  for (const root of ALLOWED_PATHS) {
+  for (const root of roots) {
     let realRoot;
     try {
       realRoot = await fsp.realpath(root);
@@ -110,7 +121,7 @@ export async function resolveAllowedPath(rawPath) {
   }
 
   throw new ToolError(
-    `Path "${p}" is outside this server's allowed roots: ${ALLOWED_PATHS.join(", ")}`
+    `Path "${p}" is outside this server's allowed roots: ${roots.join(", ")}`
   );
 }
 
@@ -242,4 +253,74 @@ export async function execToText(argv, timeoutMs = EXEC_TIMEOUT_MS) {
     return `Command failed with exit code ${r.code} (no output)`;
   }
   return out || "(no output)";
+}
+
+// ---------------------------------------------------------------------------
+// Docker Compose
+// ---------------------------------------------------------------------------
+
+const COMPOSE_FILE_RE = /\.ya?ml$/i;
+
+/**
+ * Resolve a compose file against ALLOWED_COMPOSE_PATHS — its own root list,
+ * not the file tools' roots. Bringing a stack up is a heavier grant than
+ * editing a script, because a compose file may request bind mounts and
+ * privileged containers, so it takes a separate deliberate opt-in.
+ */
+export async function resolveComposeFile(rawPath) {
+  const file = await resolveAllowedPath(
+    rawPath,
+    ALLOWED_COMPOSE_PATHS,
+    "Compose tools are disabled on this server — set ALLOWED_COMPOSE_PATHS (comma-separated directory roots) in the service env and restart."
+  );
+  if (!COMPOSE_FILE_RE.test(file)) {
+    throw new ToolError(`Not a compose file (expected .yml or .yaml): ${rawPath}`);
+  }
+  let st;
+  try {
+    st = await fsp.stat(file);
+  } catch {
+    throw new ToolError(`Compose file not found: ${rawPath}`);
+  }
+  if (!st.isFile()) throw new ToolError(`Not a regular file: ${rawPath}`);
+  return file;
+}
+
+/**
+ * Compose ships two ways: as the `docker compose` CLI plugin (current) and as
+ * the standalone `docker-compose` binary (older boxes). Probe once and cache,
+ * so a box with only one of them still works without configuration.
+ */
+let composeBaseArgv = null;
+export async function composeCommand() {
+  if (composeBaseArgv) return composeBaseArgv;
+  const plugin = await exec(["docker", "compose", "version"], 10_000);
+  if (plugin.code === 0) {
+    composeBaseArgv = ["docker", "compose"];
+    return composeBaseArgv;
+  }
+  const standalone = await exec(["docker-compose", "version"], 10_000);
+  if (standalone.code === 0) {
+    composeBaseArgv = ["docker-compose"];
+    return composeBaseArgv;
+  }
+  throw new ToolError(
+    "Neither `docker compose` nor `docker-compose` is available on this server."
+  );
+}
+
+/**
+ * Compose service names named by a caller. Shape-checked only: they are
+ * already scoped to one jailed compose file, and the check is what keeps a
+ * name from being read as a command-line option.
+ */
+export function validateComposeServices(raw) {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new ToolError("services must be an array of strings");
+  if (raw.length > 32) throw new ToolError("Too many services (max 32)");
+  return raw.map((value) => {
+    const name = String(value);
+    if (!NAME_RE.test(name)) throw new ToolError(`Invalid compose service name: "${name}"`);
+    return name;
+  });
 }

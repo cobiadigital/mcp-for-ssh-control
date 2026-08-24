@@ -25,6 +25,7 @@ import {
   configErrors,
 } from "./config.js";
 import { requireServiceToken } from "./auth.js";
+import { describeAllowlist } from "./sandbox.js";
 import { registerTools } from "./tools.js";
 
 const errors = configErrors();
@@ -118,7 +119,7 @@ app.use((err, _req, res, _next) => {
 
 app.listen(PORT, HOST, () => {
   console.log(`MCP server "${SERVER_ID}" v2.0.0 listening on http://${HOST}:${PORT}/mcp`);
-  console.log(`  containers: ${ALLOWED_CONTAINERS.join(", ") || "(none — set ALLOWED_CONTAINERS)"}`);
-  console.log(`  services:   ${ALLOWED_SERVICES.join(", ")}`);
+  console.log(`  containers: ${describeAllowlist(ALLOWED_CONTAINERS, "container")}`);
+  console.log(`  services:   ${describeAllowlist(ALLOWED_SERVICES, "service")}`);
   console.log(`  path roots: ${ALLOWED_PATHS.join(", ") || "(none — file and script tools disabled)"}`);
 });
