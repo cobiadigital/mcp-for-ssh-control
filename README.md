@@ -440,6 +440,15 @@ the Worker, and only the boxes and the portal need them now.
 
 ## Troubleshooting
 
+**The service will not start: `status=203/EXEC`.** systemd could not find
+Node at the path in `ExecStart`. The shipped unit uses `/usr/bin/env node`,
+which searches systemd's default service PATH and so covers both
+`/usr/bin/node` and `/usr/local/bin/node`. If your Node lives outside that
+PATH — nvm installs under `~/.nvm`, and a `User=` service gets the *system*
+PATH, not that user's login PATH — put the absolute path from
+`command -v node` into `ExecStart` instead. On a box with more than one Node,
+check which one actually got used: `systemctl show -p ExecStart mcp-server`.
+
 **Server status is `Error` or `unreachable`.** Cloudflare cannot reach the
 box. Check in order: the tunnel is running (`cloudflared` in `systemctl` or
 `pm2 list`), the service is running (`systemctl status mcp-server`), the DNS
