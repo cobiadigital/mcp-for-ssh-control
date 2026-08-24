@@ -6,6 +6,24 @@
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now mcp-server
 #
+# If it fails to start with status=203/EXEC, systemd could not find node.
+# Check where yours actually is:
+#
+#   command -v node        # e.g. /usr/bin/node, or /usr/local/bin/node
+#
+# The ExecStart below runs it through `env`, which searches systemd's default
+# PATH for services — /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
+# /bin — so both of those locations work without editing anything. A Node
+# installed somewhere outside that PATH (nvm puts it under ~/.nvm) will NOT be
+# found, because a User= service still gets the system PATH rather than that
+# user's login PATH. In that case replace `/usr/bin/env node` with the
+# absolute path that `command -v node` printed.
+#
+# Note that on a box with more than one Node installed, `env` picks the first
+# one on that system PATH, which is not necessarily the one your shell uses.
+# The server needs Node 20 or newer. To pin a specific one, use its absolute
+# path here and confirm with: systemctl show -p ExecStart mcp-server
+#
 # Then add "mcp-server" to ALLOWED_SERVICES so you can check its own status
 # through the portal.
 
@@ -19,7 +37,7 @@ Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/mcp-for-ssh-control/mcp-server
 EnvironmentFile=/home/ubuntu/mcp-for-ssh-control/mcp-server/.env
-ExecStart=/usr/bin/node src/index.js
+ExecStart=/usr/bin/env node src/index.js
 Restart=on-failure
 RestartSec=5
 
