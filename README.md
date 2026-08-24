@@ -455,9 +455,45 @@ box. Check in order: the tunnel is running (`cloudflared` in `systemctl` or
 record is proxied, and the registered URL ends in `/mcp`. Hovering the status
 in the dashboard shows the HTTP status Cloudflare actually got.
 
-**Server status is `Error` with HTTP 401.** The headers in
+**Server status is `Error` with HTTP 403 and an HTML body titled
+`Error ・ Cloudflare Access`.** The request never reached the box — Access
+blocked it at the edge and served its login page, which a machine client sees
+as a 403. This server only ever answers JSON, so an HTML body is proof the
+edge answered rather than the origin.
+
+The cause is the Access application on the *tunnel hostname*, which is a
+different object from the MCP server entry in AI controls. Open **Access >
+Applications >** that hostname **> Policies** and add one with **Action:
+Service Auth** and **Include: Service Token >** your token. It must be
+*Service Auth*: an *Allow* policy still expects an identity and redirects a
+non-browser client to the IdP, producing exactly this page. Then **Sync
+capabilities** on the server.
+
+Note that registering an MCP server creates its own Access application of
+type *mcp*. If the hostname already had a self-hosted Access application, two
+now cover it — filter Applications by hostname and confirm which is matching.
+
+**Server status is `Error` with HTTP 401.** This one *did* reach the box: the
+401 is this server's own check, returned as JSON. The headers in
 `auth_credentials` do not match the box's `.env`. Note that a service token's
-client id ends in `.access` — a truncated copy is the usual culprit.
+client id ends in `.access` — a truncated copy is the usual culprit. Also
+confirm all four headers are present: Access consumes the `CF-Access-*` pair
+at the edge, so the origin only ever sees the `X-Internal-*` copy, and sending
+only the former gets you past Access and then straight into a 401.
+
+To tell the two apart without the dashboard, send the portal's exact request
+yourself:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST https://<hostname>/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'CF-Access-Client-Id: <id>.access' \
+  -H 'CF-Access-Client-Secret: <secret>' \
+  -H 'X-Internal-Client-Id: <id>.access' \
+  -H 'X-Internal-Client-Secret: <secret>' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
 
 **`No allowed servers available, check your Zero Trust Policies`.** The
 portal has a policy but a server does not, or the server is not `Ready`.
