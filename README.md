@@ -613,6 +613,20 @@ the unit stuck in `activating (start)` rather than `active (running)`. Passing
 prechecks rule out network, DNS and firewall — connectivity is fine and the
 edge is refusing the registration.
 
+Under pm2 the same fault arrives differently: the tunnel name is baked into
+the process's `script args` when it is created, so a process left over from an
+earlier install keeps running whatever tunnel it was started with. Check with
+`pm2 describe cloudflared` and read `script args`, `exec cwd` and `created at`
+— a cwd pointing at a directory this version no longer has, or a creation date
+older than the install, means it is a leftover. `restarts: 0` and status
+`online` are not reassurance here: the process stays up while failing to
+register in a loop, so pm2 never restarts it. Editing config will not help;
+`pm2 delete cloudflared` and start it again with the right tunnel.
+
+Give every box its own tunnel and its own credentials. Two machines running
+one tunnel both register it, and Cloudflare routes each request to whichever
+answers, so the boxes intermittently swap identities.
+
 Fix it by making `/etc/cloudflared/config.yml` correct (see
 [step 2](#2-cloudflare-tunnel)), stopping any hand-run `cloudflared`, and
 restarting the service. Then confirm the hostname's DNS points at the tunnel
