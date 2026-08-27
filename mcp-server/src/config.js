@@ -6,6 +6,52 @@
  * token, so an unauthenticated server cannot exist even by accident.
  */
 
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+/**
+ * Read the .env sitting beside the service into process.env.
+ *
+ * systemd hands these over through `EnvironmentFile=`, but pm2 has no
+ * equivalent and a bare `node src/index.js` has none either — so without this
+ * the same .env that works under systemd leaves the process with no
+ * credentials, and it exits reporting a missing service token. Reading the
+ * file here makes all three launch methods behave the same.
+ *
+ * Variables already present in the environment always win, so systemd's
+ * EnvironmentFile and an explicit `FOO=bar node src/index.js` both still
+ * override the file rather than fighting it.
+ */
+function loadEnvFile() {
+  const envPath = path.join(
+    path.dirname(path.dirname(fileURLToPath(import.meta.url))),
+    ".env"
+  );
+  let raw;
+  try {
+    raw = fs.readFileSync(envPath, "utf8");
+  } catch {
+    return; // no .env is fine — the environment may supply everything
+  }
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    if (!key || key in process.env) continue;
+    let value = trimmed.slice(eq + 1).trim();
+    // Strip one layer of matching quotes, the way systemd and dotenv do.
+    if (value.length >= 2 && (value[0] === '"' || value[0] === "'") && value.at(-1) === value[0]) {
+      value = value.slice(1, -1);
+    }
+    process.env[key] = value;
+  }
+}
+
+loadEnvFile();
+
 const list = (value, fallback = "") =>
   String(value ?? fallback)
     .split(",")

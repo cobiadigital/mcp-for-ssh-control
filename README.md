@@ -170,10 +170,17 @@ sudo systemctl enable --now mcp-server
 Without root, pm2 works equally well:
 
 ```bash
-pm2 start "node src/index.js" --name mcp-server --update-env
+cd ~/mcp-for-ssh-control/mcp-server
+pm2 start src/index.js --name mcp-server
 pm2 save
 ( crontab -l 2>/dev/null; echo "@reboot $(which pm2) resurrect" ) | crontab -
 ```
+
+pm2 has no equivalent of systemd's `EnvironmentFile=`, so the service reads
+`.env` itself, from the directory above `src/`. Start it from anywhere and it
+still finds the file. Anything already set in the environment wins over the
+file, so systemd's `EnvironmentFile=` and a one-off
+`PORT=9000 node src/index.js` both still override it.
 
 The service refuses to start without `ACCESS_CLIENT_ID` and
 `ACCESS_CLIENT_SECRET`, so you will come back to this after step 3.
@@ -553,6 +560,14 @@ Rotate the Access service tokens while you are there — v1 shared them with
 the Worker, and only the boxes and the portal need them now.
 
 ## Troubleshooting
+
+**The service will not start: `ACCESS_CLIENT_ID and ACCESS_CLIENT_SECRET must
+be set`, but they are in `.env`.** The process is not seeing the file. It
+reads `.env` from the directory above `src/`, so check it is
+`mcp-server/.env` and not somewhere else, that it is readable by the service
+user, and that the values are bare `KEY=value` lines. Under pm2 this was the
+normal outcome before the service read `.env` for itself — if you are running
+an older checkout, `git pull` and restart.
 
 **The service will not start: `status=203/EXEC`.** systemd could not find
 Node at the path in `ExecStart`. The shipped unit uses `/usr/bin/env node`,
