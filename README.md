@@ -170,10 +170,17 @@ sudo systemctl enable --now mcp-server
 Without root, pm2 works equally well:
 
 ```bash
-pm2 start "node src/index.js" --name mcp-server --update-env
+cd ~/mcp-for-ssh-control/mcp-server
+pm2 start src/index.js --name mcp-server
 pm2 save
 ( crontab -l 2>/dev/null; echo "@reboot $(which pm2) resurrect" ) | crontab -
 ```
+
+pm2 has no equivalent of systemd's `EnvironmentFile=`, so the service reads
+`.env` itself, from the directory above `src/`. Start it from anywhere and it
+still finds the file. Anything already set in the environment wins over the
+file, so systemd's `EnvironmentFile=` and a one-off
+`PORT=9000 node src/index.js` both still override it.
 
 The service refuses to start without `ACCESS_CLIENT_ID` and
 `ACCESS_CLIENT_SECRET`, so you will come back to this after step 3.
@@ -209,6 +216,26 @@ cloudflared tunnel route dns lightsail-mcp lightsail-mcp.<yourdomain>.com
 sudo cloudflared service install        # or: pm2 start "cloudflared tunnel run lightsail-mcp" --name cloudflared
 ```
 
+Know what `service install` does with that config: it **copies** it to
+`/etc/cloudflared/config.yml` and the service reads the copy from then on.
+Editing `~/.cloudflared/config.yml` afterwards changes nothing, and running
+`cloudflared tunnel run` by hand — which reads the home-directory file —
+can succeed while the service keeps failing against a stale copy. On a
+rebuilt box the `/etc` copy may still name a tunnel that no longer exists.
+
+So after installing, confirm the service is using the config you think it is:
+
+```bash
+systemctl cat cloudflared | grep -- --config    # which file the unit reads
+sudo cat /etc/cloudflared/config.yml            # what is actually in it
+cloudflared tunnel list                         # does that tunnel still exist?
+```
+
+Treat `/etc/cloudflared/config.yml` as authoritative and edit it directly.
+Keep the credentials JSON beside it (`sudo cp ~/.cloudflared/<TUNNEL_ID>.json
+/etc/cloudflared/ && sudo chmod 600 /etc/cloudflared/<TUNNEL_ID>.json`) so the
+service does not depend on a home directory it may not be able to read.
+
 No firewall changes — the tunnel is an outbound connection. Confirm the DNS
 record Cloudflare created for the hostname has **Proxy status: Proxied**.
 
@@ -240,6 +267,19 @@ a failure is unambiguously the service's fault rather than the network's. All
 This is the step that replaces the entire Worker. The portal reaches each box
 by sending the box's service token as request headers.
 
+**Set the headers on the Authentication tab.** The *Add an MCP server* wizard
+does not ask for them — it collects a name, a Server ID, a URL and policies,
+then offers OAuth — so a server is registered with no credentials and the
+portal reaches your hostname bare, which Cloudflare Access answers with a 403
+block page. Adding them is a second, separate step:
+
+**AI controls > MCP servers >** the server **> ⋯ > Edit > Authentication**,
+then add the four headers below as custom headers.
+
+Doing it in the dashboard needs no API token. The same thing is settable
+through the API — see [via the API](#registering-a-server-via-the-api) — but
+that is a convenience for scripting several boxes, not a requirement.
+
 Cloudflare stores those headers as the server's `auth_credentials`, which the
 [API documents][auth-docs] as a JSON string whose headers are forwarded
 verbatim upstream. Send **both** header pairs: Access validates and consumes
@@ -247,6 +287,25 @@ the `CF-Access-*` pair at the edge, and the `X-Internal-*` pair passes through
 for the box's own re-check.
 
 [auth-docs]: https://developers.cloudflare.com/cloudflare-one/access-controls/ai-controls/mcp-portals/#bearer-authentication-credentials
+
+#### Registering a server via the API
+
+Useful for scripting several boxes at once. The dashboard route above does the
+same thing and needs none of this.
+
+`CLOUDFLARE_API_TOKEN` is a third credential, distinct from the Access service
+token and from the tunnel's credentials JSON. Create it under **My Profile >
+API Tokens > Create Custom Token**. Cloudflare documents these endpoints as
+checking the account permission **Access: Apps and Policies** — *Edit* rather
+than *Read*, since these calls write. `ACCOUNT_ID` is in any zone's Overview
+sidebar, or in the dashboard URL.
+
+Be ready to give up on the API quickly. A token missing the right permission
+returns `403` with `{"code":10000,"message":"Authentication error"}`, which
+names neither the permission nor even that the token is at fault, and the same
+message covers a stale token value, so it gives you nothing to iterate on. If
+a token with that permission still gets a 403, use the Authentication tab
+instead of hunting for the right scope — it is the same setting either way.
 
 ```bash
 curl "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/access/ai-controls/mcp/servers" \
@@ -270,6 +329,26 @@ Notes that matter:
   built](#how-tool-names-are-built) below for why.
 - The same values are editable in the dashboard afterwards under **AI
   controls > MCP servers >** the server **> Authentication**.
+- To repair a server that already exists — one registered without headers, or
+  one whose token was rotated — `PUT` to
+  `.../ai-controls/mcp/servers/{server_id}` with the same two fields. Check
+  what a server currently has with a `GET` on `.../ai-controls/mcp/servers`
+  and look at `auth_type`: anything other than `bearer` means no headers are
+  being sent. `auth_credentials` is stored encrypted and never returned, so
+  its absence from that response tells you nothing.
+- Let a tool build the JSON. `auth_credentials` is a JSON *string* containing
+  a `headers` object, and hand-escaping the quotes is the usual way this goes
+  wrong:
+
+  ```bash
+  CRED=$(jq -nc --arg id "$TOKEN_ID" --arg sec "$TOKEN_SECRET" '{
+    headers: {
+      "CF-Access-Client-Id": $id, "CF-Access-Client-Secret": $sec,
+      "X-Internal-Client-Id": $id, "X-Internal-Client-Secret": $sec
+    }
+  }')
+  jq -nc --arg c "$CRED" '{auth_type:"bearer", auth_credentials:$c}'
+  ```
 
 Then attach an Access policy to the server (**AI controls > MCP servers >
 Edit > Policies**) allowing your own identity. A server with no policy is
@@ -316,13 +395,55 @@ your own identity — this is the policy that replaces v1's single-user GitHub
 allowlist, and it is the only thing standing between the internet and your
 boxes, so scope it to you specifically.
 
-For each server in the portal, leave **Require user auth** off. It only
-applies to servers using per-user upstream OAuth; these use a service token.
+**Turn `Require user auth` OFF for every server in the portal.** It is
+**on by default**, and on is wrong here: it tells the portal to run a
+second, per-user OAuth flow against the box. These boxes have no OAuth — the
+service token is the whole authentication story — so that flow dead-ends. Off
+means the portal uses the stored credential, which is what the headers from
+step 4 are.
+
+The symptom if you miss it is specific and does not look like this setting:
+you authenticate to the portal successfully, and then land on
+`https://<portal-hostname>/servers-callback?oauth_session_nonce=...` showing
+**not found**. That path is the portal's *upstream* OAuth callback — proof it
+was trying to OAuth against a box rather than finishing your login.
 
 Creating the portal in the dashboard also creates the CNAME to
 `gateway.agents.cloudflare.com`. If you use the API or Terraform instead,
 create that record yourself and make sure it is proxied — a missing record
 is the usual cause of a `522`.
+
+### 5b. Turn on Managed OAuth for the portal
+
+Without this an MCP client cannot register itself and Claude reports
+`Couldn't register with <portal>'s sign-in service`. Access replies to a
+non-browser client with a browser redirect instead of the `401` and
+`WWW-Authenticate` discovery metadata a client needs.
+
+**AI controls > Portals >** the portal **> ⋯ > Edit > Advanced settings**:
+
+1. Turn on **Managed OAuth**.
+2. Under **Allowed redirect URIs**, add your client's callback. Dynamic client
+   registration is refused when this list is empty, which is the same
+   registration error as above. For Claude.ai in a browser, and for the
+   desktop and mobile apps, that is:
+
+   ```
+   https://claude.ai/api/mcp/auth_callback
+   ```
+
+   If a client still fails to register, read the callback out of the error or
+   the address bar rather than guessing — the client chooses its own redirect
+   URI and this list only permits it.
+3. Turn on **Allow loopback clients** if you also connect Claude Code from a
+   terminal. It redirects to `127.0.0.1` on a port chosen per run, so no fixed
+   URI can cover it. Leave off if you only use the web and desktop apps.
+4. Set **Grant session duration** to 1–2 weeks and leave **Access token
+   lifetime** at the 15-minute default. This is Cloudflare's recommendation
+   for agent clients: the client refreshes silently, your Access policies are
+   re-evaluated on every refresh, and you only see a browser prompt when the
+   grant expires. The default grant is tied to the session duration and will
+   have you re-authorizing far more often.
 
 ### 6. Connect Claude
 
@@ -440,6 +561,14 @@ the Worker, and only the boxes and the portal need them now.
 
 ## Troubleshooting
 
+**The service will not start: `ACCESS_CLIENT_ID and ACCESS_CLIENT_SECRET must
+be set`, but they are in `.env`.** The process is not seeing the file. It
+reads `.env` from the directory above `src/`, so check it is
+`mcp-server/.env` and not somewhere else, that it is readable by the service
+user, and that the values are bare `KEY=value` lines. Under pm2 this was the
+normal outcome before the service read `.env` for itself — if you are running
+an older checkout, `git pull` and restart.
+
 **The service will not start: `status=203/EXEC`.** systemd could not find
 Node at the path in `ExecStart`. The shipped unit uses `/usr/bin/env node`,
 which searches systemd's default service PATH and so covers both
@@ -455,9 +584,95 @@ box. Check in order: the tunnel is running (`cloudflared` in `systemctl` or
 record is proxied, and the registered URL ends in `/mcp`. Hovering the status
 in the dashboard shows the HTTP status Cloudflare actually got.
 
-**Server status is `Error` with HTTP 401.** The headers in
+**Claude says `Couldn't register with <portal>'s sign-in service`.** The
+portal's Access application is not offering OAuth registration. Turn on
+**Managed OAuth** and add the client's callback under **Allowed redirect
+URIs** — an empty list refuses every registration. See
+[step 5b](#5b-turn-on-managed-oauth-for-the-portal).
+
+**You authenticate to the portal, then get `not found` at
+`https://<portal-hostname>/servers-callback`.** The login itself worked. That
+path is the portal's *upstream* OAuth callback, so reaching it means the
+portal tried to run a per-user OAuth flow against one of your boxes — which
+have no OAuth. Turn **Require user auth** off for every server in the portal
+(**Portals > Edit > Servers**); it is on by default. See
+[step 5](#5-create-the-portal).
+
+**Server status is `Error` with HTTP 503, and `cloudflared tunnel run` works
+by hand but the service does not.** The two read different files. `cloudflared
+service install` copies your config to `/etc/cloudflared/config.yml` and the
+unit runs with `--config /etc/cloudflared/config.yml`, while a bare
+`cloudflared tunnel run` reads `~/.cloudflared/config.yml`. If the `/etc` copy
+names a tunnel that was since deleted or recreated — common after rebuilding a
+box — the service authenticates against a tunnel that no longer matches.
+
+The signature in `journalctl -u cloudflared` is distinctive: the prechecks all
+pass (`QUIC connection successful`, `API is reachable`) and then
+`control stream encountered a failure while serving`, retrying forever, with
+the unit stuck in `activating (start)` rather than `active (running)`. Passing
+prechecks rule out network, DNS and firewall — connectivity is fine and the
+edge is refusing the registration.
+
+Fix it by making `/etc/cloudflared/config.yml` correct (see
+[step 2](#2-cloudflare-tunnel)), stopping any hand-run `cloudflared`, and
+restarting the service. Then confirm the hostname's DNS points at the tunnel
+that is actually running — a CNAME still aimed at a dead tunnel's
+`<uuid>.cfargotunnel.com` returns the same 503 even after the service
+connects:
+
+```bash
+cloudflared tunnel route dns <working-tunnel> <hostname>
+```
+
+**Server status is `Error` with HTTP 403 and an HTML body titled
+`Error ・ Cloudflare Access`.** The request never reached the box — Access
+blocked it at the edge and served its login page, which a machine client sees
+as a 403. This server only ever answers JSON, so an HTML body is proof the
+edge answered rather than the origin.
+
+There are two ways to earn this, and they are easy to confuse. If sending the
+headers by hand (the `curl` below) also returns 403, the Access policy is
+wrong — see the fix in the next paragraph. If that `curl` returns **200** and
+only the portal gets 403, the policy is fine and the portal is not sending the
+headers at all: check the server's `auth_type` is `bearer` and re-set its
+`auth_credentials`, per [step 4](#4-register-each-box-as-an-mcp-server-in-access).
+A server registered without its headers lands in this second case — the *Add
+an MCP server* wizard never asks for them, so this is the normal state of a
+newly added server until you set them on its **Edit > Authentication** tab.
+
+The cause is the Access application on the *tunnel hostname*, which is a
+different object from the MCP server entry in AI controls. Open **Access >
+Applications >** that hostname **> Policies** and add one with **Action:
+Service Auth** and **Include: Service Token >** your token. It must be
+*Service Auth*: an *Allow* policy still expects an identity and redirects a
+non-browser client to the IdP, producing exactly this page. Then **Sync
+capabilities** on the server.
+
+Note that registering an MCP server creates its own Access application of
+type *mcp*. If the hostname already had a self-hosted Access application, two
+now cover it — filter Applications by hostname and confirm which is matching.
+
+**Server status is `Error` with HTTP 401.** This one *did* reach the box: the
+401 is this server's own check, returned as JSON. The headers in
 `auth_credentials` do not match the box's `.env`. Note that a service token's
-client id ends in `.access` — a truncated copy is the usual culprit.
+client id ends in `.access` — a truncated copy is the usual culprit. Also
+confirm all four headers are present: Access consumes the `CF-Access-*` pair
+at the edge, so the origin only ever sees the `X-Internal-*` copy, and sending
+only the former gets you past Access and then straight into a 401.
+
+To tell the two apart without the dashboard, send the portal's exact request
+yourself:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST https://<hostname>/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'CF-Access-Client-Id: <id>.access' \
+  -H 'CF-Access-Client-Secret: <secret>' \
+  -H 'X-Internal-Client-Id: <id>.access' \
+  -H 'X-Internal-Client-Secret: <secret>' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
 
 **`No allowed servers available, check your Zero Trust Policies`.** The
 portal has a policy but a server does not, or the server is not `Ready`.
