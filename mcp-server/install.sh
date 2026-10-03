@@ -54,19 +54,43 @@ ask() {
 
 # ---------------------------------------------------------------- 1. Node
 say "1/6 Node.js"
-need_node=1
-if command -v node >/dev/null; then
-  major="$(node -p 'process.versions.node.split(".")[0]')"
-  [[ $major -ge 20 ]] && need_node=0
-fi
-if [[ $need_node -eq 1 ]]; then
-  echo "Node 20 or newer is required and was not found."
-  ask yn "Install Node 22 from NodeSource now? (y/n)" "y"
+# Pick a node >= 20 by explicit path. Some images (Bitnami) put an older node
+# first on PATH, so `command -v node` can be the wrong one even after a new
+# Node is installed.
+find_node() {
+  local c major
+  for c in "$(command -v node 2>/dev/null || true)" /usr/bin/node /usr/local/bin/node; do
+    [[ -n $c && -x $c ]] || continue
+    major="$("$c" -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+    if [[ $major -ge 20 ]]; then echo "$c"; return 0; fi
+  done
+  return 1
+}
+if ! NODE_BIN="$(find_node)"; then
+  echo "Node 20 or newer was not found (PATH node: $(node -v 2>/dev/null || echo none))."
+  ask yn "Install Node 20 from nodejs.org into /usr/local now? (y/n)" "y"
   [[ $yn == y* ]] || { echo "Install Node 20+ and re-run." >&2; exit 1; }
-  curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-  sudo apt-get install -y nodejs
+  # Official tarball rather than apt/NodeSource: works on old Debian images
+  # (Bitnami) where the distro package is Node 10 and NodeSource may not
+  # support the release. Needs glibc 2.28 or newer.
+  case "$(uname -m)" in
+    x86_64) narch=x64 ;;
+    aarch64|arm64) narch=arm64 ;;
+    *) echo "Unsupported CPU: $(uname -m)" >&2; exit 1 ;;
+  esac
+  base="https://nodejs.org/dist/latest-v20.x"
+  file="$(curl -fsSL "$base/SHASUMS256.txt" | awk -v a="linux-$narch.tar.xz" '$2 ~ a"$" {print $2; exit}')"
+  [[ -n $file ]] || { echo "Could not find a Node 20 download." >&2; exit 1; }
+  ntmp="$(mktemp)"
+  curl -fsSL "$base/$file" -o "$ntmp"
+  sudo tar -xJf "$ntmp" -C /usr/local --strip-components=1 --no-same-owner \
+    --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md'
+  rm -f "$ntmp"
+  NODE_BIN="$(find_node)" || { echo "Node 20+ still not found after install." >&2; exit 1; }
 fi
-echo "node $(node -v) at $(command -v node)"
+# Make this node (and its npm) win for the rest of the script.
+export PATH="$(dirname "$NODE_BIN"):$PATH"
+echo "Using node $("$NODE_BIN" -v) at $NODE_BIN"
 
 npm install --no-audit --no-fund
 
@@ -180,13 +204,15 @@ sec="$(get_env ACCESS_CLIENT_SECRET || true)"
 
 # ---------------------------------------------------------------- 6. service
 say "6/6 systemd service"
-NODE_BIN="$(command -v node)"
 tmp="$(mktemp)"
 sed -e "s|^User=.*|User=$SVC_USER|" \
     -e "s|^WorkingDirectory=.*|WorkingDirectory=$DIR|" \
     -e "s|^EnvironmentFile=.*|EnvironmentFile=$ENV_FILE|" \
     -e "s|^ExecStart=.*|ExecStart=$NODE_BIN src/index.js|" \
     mcp-server.service.example > "$tmp"
+if [[ "$(systemctl --version | awk 'NR==1{print $2}')" -lt 242 ]]; then
+  sed -i '/^RestrictSUIDSGID=/d' "$tmp"   # unknown to older systemd
+fi
 sudo install -m 644 "$tmp" /etc/systemd/system/mcp-server.service
 rm -f "$tmp"
 sudo systemctl daemon-reload
