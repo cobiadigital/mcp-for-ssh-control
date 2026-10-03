@@ -68,10 +68,24 @@ find_node() {
 }
 if ! NODE_BIN="$(find_node)"; then
   echo "Node 20 or newer was not found (PATH node: $(node -v 2>/dev/null || echo none))."
-  ask yn "Install Node 22 from NodeSource now? (y/n)" "y"
+  ask yn "Install Node 20 from nodejs.org into /usr/local now? (y/n)" "y"
   [[ $yn == y* ]] || { echo "Install Node 20+ and re-run." >&2; exit 1; }
-  curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-  sudo apt-get install -y nodejs
+  # Official tarball rather than apt/NodeSource: works on old Debian images
+  # (Bitnami) where the distro package is Node 10 and NodeSource may not
+  # support the release. Needs glibc 2.28 or newer.
+  case "$(uname -m)" in
+    x86_64) narch=x64 ;;
+    aarch64|arm64) narch=arm64 ;;
+    *) echo "Unsupported CPU: $(uname -m)" >&2; exit 1 ;;
+  esac
+  base="https://nodejs.org/dist/latest-v20.x"
+  file="$(curl -fsSL "$base/SHASUMS256.txt" | awk -v a="linux-$narch.tar.xz" '$2 ~ a"$" {print $2; exit}')"
+  [[ -n $file ]] || { echo "Could not find a Node 20 download." >&2; exit 1; }
+  ntmp="$(mktemp)"
+  curl -fsSL "$base/$file" -o "$ntmp"
+  sudo tar -xJf "$ntmp" -C /usr/local --strip-components=1 --no-same-owner \
+    --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md'
+  rm -f "$ntmp"
   NODE_BIN="$(find_node)" || { echo "Node 20+ still not found after install." >&2; exit 1; }
 fi
 # Make this node (and its npm) win for the rest of the script.
