@@ -117,6 +117,7 @@ mcp-server/                 — runs on each box; this is the whole product
   src/auth.js                 — service-token check (timing-safe)
   src/sandbox.js              — allowlists, path jail, argv execution
   src/tools.js                — the 14 tool definitions
+  install.sh                  — box-side installer for Ubuntu
   smoke-test.sh               — verifies auth, handshake, and that the
                                 allowlists actually reject
   mcp-server.service.example  — systemd unit template
@@ -136,6 +137,15 @@ for setup only.
 Steps 1–3 are per box. Steps 4–6 are once.
 
 ### 1. Install the MCP server on the box
+
+**Shortcut (Ubuntu):** `cd mcp-for-ssh-control/mcp-server && ./install.sh`
+does steps 1 to 3 below on the box: Node, `npm install`, `.env`, the systemd
+unit, `cloudflared`, and the smoke test. It pauses to tell you what to click
+in the Cloudflare dashboard and needs no API token: you create the tunnel in
+the dashboard and paste its tunnel token once. It differs from the manual
+steps in one way, the tunnel is remotely managed, so its hostname routing
+lives in the dashboard instead of `/etc/cloudflared/config.yml`. Steps 4 to 6
+stay manual.
 
 ```bash
 git clone https://github.com/cobiadigital/mcp-for-ssh-control.git
